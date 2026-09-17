@@ -8,38 +8,52 @@ export const STORAGE_KEY = 'p2p-watcher.sources.v1';
 export const HOST_STORAGE_KEY = 'p2p-watcher.hosted.v1';
 
 const ID_RE = /^[0-9a-f]{32}$/i;
-const KEY_RE = /^[A-Za-z0-9_-]{32,86}$/;
+const HEX_KEY_RE = /^[0-9a-f]{64}$/i;
+const LEGACY_KEY_RE = /^[A-Za-z0-9_-]{32,86}$/;
 
 export function parsePair(s) {
   if (typeof s !== 'string') return null;
   const i = s.indexOf(':');
   if (i <= 0) return null;
-  const id = s.slice(0, i).trim();
-  const key = s.slice(i + 1).trim();
-  if (!ID_RE.test(id) || !KEY_RE.test(key)) return null;
-  return { id: id.toLowerCase(), key };
+  const id = s.slice(0, i).trim().toLowerCase();
+  let shareKey = s.slice(i + 1).trim();
+  if (!ID_RE.test(id)) return null;
+  if (HEX_KEY_RE.test(shareKey)) shareKey = shareKey.toLowerCase();
+  else if (!LEGACY_KEY_RE.test(shareKey)) return null;
+  return { id, key: shareKey };
 }
 
 export function parseHash(hash) {
-  const h = String(hash || '').replace(/^#/, '');
-  if (!h) return { action: 'none', sources: [] };
-  if (h.startsWith('add=')) {
-    const src = parsePair(h.slice(4));
+  const raw = String(hash || '').replace(/^#/, '');
+  if (!raw) return { action: 'none', sources: [] };
+  const lower = raw.toLowerCase();
+  const payload = raw.slice(raw.indexOf('=') + 1);
+  if (lower.startsWith('add=')) {
+    const src = parsePair(payload);
     return src ? { action: 'add', sources: [src] } : { action: 'invalid', sources: [] };
   }
-  if (h.startsWith('bundle=')) {
-    const sources = h.slice(7).split('&').map(parsePair).filter(Boolean);
+  if (lower.startsWith('bundle=')) {
+    const sources = payload.split('&').map(parsePair).filter(Boolean);
     return { action: sources.length ? 'bundle' : 'invalid', sources };
   }
   return { action: 'none', sources: [] };
 }
 
 export function buildAddHash(id, key) {
-  return `#add=${id}:${key}`;
+  const k = HEX_KEY_RE.test(key) ? String(key).toLowerCase() : key;
+  return `#add=${String(id).toLowerCase()}:${k}`;
 }
 
 export function buildBundleHash(sources) {
-  return '#bundle=' + sources.map((s) => `${s.id}:${s.key}`).join('&');
+  return (
+    '#bundle=' +
+    sources
+      .map((s) => {
+        const k = HEX_KEY_RE.test(s.key) ? String(s.key).toLowerCase() : s.key;
+        return `${String(s.id).toLowerCase()}:${k}`;
+      })
+      .join('&')
+  );
 }
 
 export function buildShareUrl(originPath, id, key) {
@@ -56,7 +70,7 @@ export function loadSources(storage = globalThis.localStorage, key = STORAGE_KEY
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((s) => s && ID_RE.test(s.id) && KEY_RE.test(s.key));
+    return parsed.filter((s) => s && ID_RE.test(s.id) && (HEX_KEY_RE.test(s.key) || LEGACY_KEY_RE.test(s.key)));
   } catch {
     return [];
   }
@@ -70,13 +84,14 @@ export function upsertSources(incoming, storage = globalThis.localStorage, key =
   const existing = loadSources(storage, key);
   const byId = new Map(existing.map((s) => [s.id, s]));
   for (const s of incoming) {
-    if (!s || !ID_RE.test(s.id) || !KEY_RE.test(s.key)) continue;
+    if (!s || !ID_RE.test(s.id) || !(HEX_KEY_RE.test(s.key) || LEGACY_KEY_RE.test(s.key))) continue;
     const prev = byId.get(s.id) || {};
+    const shareKey = HEX_KEY_RE.test(s.key) ? s.key.toLowerCase() : s.key;
     byId.set(s.id, {
       ...prev,
       ...s,
       id: s.id.toLowerCase(),
-      key: s.key,
+      key: shareKey,
       addedAt: prev.addedAt || Date.now(),
     });
   }
