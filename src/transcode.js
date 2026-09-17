@@ -108,7 +108,16 @@ export async function remuxToFragmentedMp4(file, onProgress) {
   let mime = 'video/mp4';
   let outName = outMp4;
   try {
+    // Three tiers, cheapest/fastest first. A real "ripped" .mkv very often
+    // carries a browser-playable video codec (H.264/HEVC) alongside an
+    // audio codec no browser decodes (AC-3, DTS, TrueHD) — that combination
+    // used to go straight to the full re-encode fallback below (slow: a
+    // real movie can take many minutes of single-threaded wasm CPU time),
+    // even though only the audio track actually needed re-encoding.
     try {
+      // Tier 1: copy both streams — fast (seconds), works when the source
+      // is already H.264/HEVC + AAC/MP3, which is common for direct-from-
+      // streaming-service rips.
       await ff.run(
         '-i',
         mount.inputPath,
@@ -123,9 +132,38 @@ export async function remuxToFragmentedMp4(file, onProgress) {
         outMp4,
       );
     } catch {
-      await ff.run('-i', mount.inputPath, '-c:v', 'libvpx', '-b:v', '1M', '-c:a', 'libvorbis', outWebm);
-      outName = outWebm;
-      mime = 'video/webm';
+      try {
+        // Tier 2: keep the (usually browser-playable) video stream as-is,
+        // re-encode only the audio to AAC. Still fast — audio re-encode is
+        // cheap compared to video — and fixes the single most common real
+        // failure (AC-3/DTS/TrueHD audio in an otherwise-fine H.264 file).
+        safeUnlink(ff, outMp4);
+        await ff.run(
+          '-i',
+          mount.inputPath,
+          '-map',
+          '0:v:0?',
+          '-map',
+          '0:a:0?',
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '160k',
+          '-movflags',
+          'frag_keyframe+empty_moov+default_base_moof',
+          outMp4,
+        );
+      } catch {
+        // Tier 3: last resort, full re-encode. This is the slow path (can
+        // legitimately take minutes for a real file) — it only runs when
+        // the video stream itself can't be carried into MP4 as-is.
+        safeUnlink(ff, outMp4);
+        await ff.run('-i', mount.inputPath, '-c:v', 'libvpx', '-b:v', '1M', '-c:a', 'libvorbis', outWebm);
+        outName = outWebm;
+        mime = 'video/webm';
+      }
     }
     const data = ff.FS('readFile', outName);
     blob = new Blob([copyOut(data)], { type: mime });
