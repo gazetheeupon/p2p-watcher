@@ -150,6 +150,8 @@ button.primary {
   font-weight: 700;
 }
 button.ghost { background: transparent; }
+button.ghost.danger { color: var(--danger); border-color: var(--danger); }
+button.ghost.danger:hover { background: rgba(255, 107, 107, 0.12); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 :focus-visible {
