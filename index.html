@@ -3,24 +3,24 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>P2P Watcher — Stream Your Media Between Your Own Devices, No Server</title>
-  <meta name="description" content="Stream a media folder from one of your browsers to another over an end-to-end encrypted peer-to-peer connection. No server, no upload, no account — just your own devices.">
+  <title>P2P Watcher — Share a Folder to Stream Between Your Own Devices</title>
+  <meta name="description" content="Share a media folder from this browser to another over an end-to-end encrypted peer-to-peer connection. No server, no upload, no account — just your own devices.">
   <link rel="stylesheet" href="./styles.css">
   <link rel="canonical" href="https://gazetheeupon.github.io/p2p-watcher/">
   <meta property="og:title" content="P2P Watcher — Cross-Device Media Streaming">
-  <meta property="og:description" content="Stream your own media folder from one browser to another, peer-to-peer and end-to-end encrypted. No server, no upload, no account.">
+  <meta property="og:description" content="Share your own media folder from one browser to another, peer-to-peer and end-to-end encrypted. No server, no upload, no account.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://gazetheeupon.github.io/p2p-watcher/">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="P2P Watcher — Cross-Device Media Streaming">
-  <meta name="twitter:description" content="Stream your own media folder from one browser to another, peer-to-peer and end-to-end encrypted. No server, no upload, no account.">
+  <meta name="twitter:description" content="Share your own media folder from one browser to another, peer-to-peer and end-to-end encrypted. No server, no upload, no account.">
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "P2P Watcher",
     "url": "https://gazetheeupon.github.io/p2p-watcher/",
-    "description": "Stream a media folder from one browser to another over an end-to-end encrypted peer-to-peer (WebRTC) connection. No server, no upload, no account required.",
+    "description": "Share a media folder from one browser to another over an end-to-end encrypted peer-to-peer (WebRTC) connection. No server, no upload, no account required.",
     "applicationCategory": "MultimediaApplication",
     "operatingSystem": "Any (runs in web browser)",
     "browserRequirements": "Requires JavaScript, Service Workers, and WebRTC.",
@@ -30,55 +30,42 @@
   </script>
 </head>
 <body>
-  <a class="skip" href="#library">Skip to library</a>
+  <a class="skip" href="#sourcesSection">Skip to your shared folders</a>
   <p class="hub-back"><a href="https://gazetheeupon.github.io/">&larr; All RunLocal tools</a></p>
   <header class="top">
     <div>
-      <h1>P2P Watcher</h1>
-      <p class="tag">Serverless Plex. Folders stay on the host PC. Clients only read.</p>
+      <h1>P2P Watcher — Host</h1>
+      <p class="tag">This tab is the source. Keep it open while anyone is watching. Playback happens on the viewer page, not here.</p>
     </div>
     <div class="top-actions">
       <button id="openFolder" class="ghost" data-nav data-testid="open-folder" hidden>Open folder</button>
-      <button id="bundleBtn" class="primary" data-nav disabled>Share library</button>
+      <button id="bundleBtn" class="primary" data-nav disabled>Combine into one link</button>
     </div>
   </header>
   <p class="scope-note">100% client-side: runs on WebRTC and the Web Crypto API. Meant for streaming between <strong>your own devices</strong> (or people you personally share a link with) &mdash; not for publishing content publicly. Only share folders you have the right to share.</p>
 
-  <p id="status" class="status" role="status">Drop a media folder on this PC to seed, or open a share link to watch.</p>
+  <p id="status" class="status" role="status">Drop a media folder on this device to start sharing it.</p>
 
   <section id="drop" class="drop" tabindex="0" data-nav data-testid="drop">
-    <strong>Drop a media folder to seed</strong>
-    <span class="hint">The tab must stay open. Nothing is uploaded. Clients cannot write to this PC.</span>
+    <strong>Drop a media folder to share</strong>
+    <span class="hint">This tab must stay open while anyone is watching. Nothing is uploaded. Viewers cannot write to this device.</span>
     <input id="folderInput" type="file" webkitdirectory multiple hidden data-testid="folder-input">
   </section>
 
-  <section>
-    <h2 class="section-title">Library</h2>
-    <p id="emptyState" class="empty">No sources yet. Seed a folder or open an <code>#add=</code> / <code>#bundle=</code> link.</p>
-    <div id="library" class="grid" data-testid="library"></div>
-  </section>
-
-  <section>
-    <h2 class="section-title">Sources</h2>
+  <section id="sourcesSection">
+    <h2 class="section-title">What you're sharing</h2>
+    <p id="emptyState" class="empty">Nothing shared yet. Drop a folder above to get a viewer link.</p>
     <ul id="sources" class="sources"></ul>
   </section>
 
-  <div id="player" class="player" hidden>
-    <div class="player-bar">
-      <button id="backBtn" class="primary" data-nav>Back</button>
-      <h2 id="nowPlaying"></h2>
-    </div>
-    <video id="video" controls playsinline></video>
-  </div>
-
   <div id="shareModal" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-labelledby="shareTitle">
-      <h2 id="shareTitle">Share this library</h2>
-      <p class="hint">Anyone with this link can read the currently saved sources. They cannot modify host files.</p>
+      <h2 id="shareTitle">One link for everything you're sharing</h2>
+      <p class="hint">Anyone with this link can watch every folder currently listed above, combined into one library. They cannot modify anything on this device.</p>
       <div id="qr" class="qr"></div>
       <pre id="bundleUrl" class="mono url" data-testid="bundle-url"></pre>
       <div class="top-actions">
-        <button id="copyBundle" class="primary" data-nav>Copy bundle URL</button>
+        <button id="copyBundle" class="primary" data-nav>Copy combined link</button>
         <button id="closeShare" class="ghost" data-nav>Close</button>
       </div>
     </div>
@@ -87,24 +74,21 @@
   <pre id="log" class="log" hidden></pre>
 
   <div class="info-card">
-    <p><strong>How this works:</strong> the PC you drop a folder onto (the "host") indexes the files in memory and connects directly to other browsers ("clients") over a WebRTC data channel. Video is streamed in range-requested chunks straight from the host's disk &mdash; nothing is ever uploaded to a server, and there's nothing to sign up for. The connection is set up through free public WebSocket trackers, but the actual offer/answer signaling is AES-GCM encrypted first, so the tracker only ever sees an encrypted blob, not what you're sharing.</p>
-    <p><strong>Clients are permanently read-only.</strong> A connected device can watch and can never write, delete, or modify anything on the host's computer &mdash; that's enforced by the host rejecting any write-type message outright, not just hidden by the UI.</p>
-    <p><strong>Keys never leave your control.</strong> The encryption key for a shared folder lives only in the share link's URL fragment (after the <code>#</code>, which browsers never send to a server) and in this browser's own <code>localStorage</code>. Closing the host's tab stops the stream; reopening it and re-dropping the same folder is required to seed again.</p>
+    <p><strong>How this works:</strong> this device (the "host") indexes the files in memory and connects directly to viewers' browsers over a WebRTC data channel. Video is streamed in range-requested chunks straight from this device's disk &mdash; nothing is ever uploaded to a server, and there's nothing to sign up for. The connection is set up through free public WebSocket trackers, but the actual offer/answer signaling is AES-GCM encrypted first, so the tracker only ever sees an encrypted blob, not what you're sharing.</p>
+    <p><strong>Viewers are permanently read-only.</strong> A connected viewer can watch and can never write, delete, or modify anything on this device &mdash; that's enforced by this device rejecting any write-type message outright, not just hidden by the viewer's UI.</p>
+    <p><strong>Keys never leave your control.</strong> The encryption key for a shared folder lives only in the viewer link's URL fragment (after the <code>#</code>, which browsers never send to a server) and in this browser's own <code>localStorage</code>. Closing this tab stops the stream; reopening it and re-dropping the same folder is required to share it again.</p>
+    <p><strong>.mkv / .avi files</strong> are remuxed on this device the first time a viewer requests them, using an in-browser build of FFmpeg &mdash; that can take a little while for a large file (a status line above will say so), and only happens once per file per session.</p>
   </div>
 
   <div class="faq-card">
     <h2>Troubleshooting</h2>
     <details>
-      <summary>Nothing happens after I open a share link</summary>
-      <p>The host's browser tab has to stay open and on this page for as long as you want to stream &mdash; closing it (or the host's computer sleeping) stops seeding. If the host is on a different network than the client, some restrictive routers/firewalls block the peer-to-peer connection entirely; there's no relay fallback if that happens.</p>
+      <summary>A viewer says they're stuck on "Connecting…"</summary>
+      <p>Check the count next to your folder above. If it already shows someone watching, the WebRTC connection itself is fine and they're most likely waiting on a first-time .mkv/.avi remux &mdash; ask them to wait, the status line on their side should be showing progress. If it still shows nobody connected after a minute or so, the two networks likely can't reach each other directly (some restrictive routers/firewalls block peer-to-peer connections entirely, and there's no relay fallback if that happens) &mdash; try a different network.</p>
     </details>
     <details>
-      <summary>Playback stalls or won't start on a large file</summary>
-      <p>Everything streams over a single WebRTC data channel at whatever speed the host's upload connection and the path between the two devices allows &mdash; a large 4K file over a slow upload will buffer slowly. <code>.mkv</code>/<code>.avi</code> files are also remuxed on the host on first request (see below), which takes a moment before the first byte can be sent.</p>
-    </details>
-    <details>
-      <summary>Why does my .mkv or .avi file take a moment to start playing?</summary>
-      <p>Browsers can't play those containers directly, so the host remuxes (or, when needed, re-encodes) the file into a browser-playable format on the fly using an in-browser build of FFmpeg, the first time it's requested. That one-time step is what the "Remuxing…" status means; the result is cached in memory for the rest of that session.</p>
+      <summary>Why does a .mkv or .avi file take a moment the first time?</summary>
+      <p>Browsers can't play those containers directly, so this device remuxes (or, when needed, re-encodes) the file into a browser-playable format on the fly the first time it's requested. That's what the "Remuxing…" status above means; the result is cached in memory for the rest of this session, so the same file plays instantly for the next viewer.</p>
     </details>
     <details>
       <summary>Is this OK to use for movies or shows I've downloaded?</summary>
@@ -113,11 +97,11 @@
   </div>
 
   <footer>
-    <p>Read-only clients by design. Keys live in the URL hash and localStorage on this device only.</p>
+    <p>Viewers are permanently read-only by design. Keys live in the URL hash and localStorage on this device only.</p>
     <p><a href="https://gazetheeupon.github.io/">RunLocal</a> &mdash; free tools that run entirely in your browser.</p>
   </footer>
 
   <script src="./vendor/qrcode-generator.js"></script>
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./host.js"></script>
 </body>
 </html>
