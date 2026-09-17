@@ -8,8 +8,8 @@
 // single-page app kept both roles' sources in one localStorage list, so a
 // browser that had ever done both would try to re-connect as a client
 // every time you reopened it as a host).
-import { generateSourceCredentials } from './src/crypto.js';
-import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js';
+import { generateSourceCredentials } from './src/crypto.js?v=hexkey1';
+import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=hexkey1';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
 import { Swarm, trackerListFromLocation } from './src/swarm.js';
 import { HostLibrary } from './src/session.js';
