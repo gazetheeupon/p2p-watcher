@@ -20,18 +20,41 @@ export function base64UrlToBytes(s) {
 
 export function randomHex(nBytes) {
   const b = crypto.getRandomValues(new Uint8Array(nBytes));
-  return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return bytesToHex(b);
+}
+
+export function hexToBytes(hex) {
+  const clean = String(hex).trim().toLowerCase();
+  if (clean.length % 2) throw new Error('odd hex length');
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const n = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(n)) throw new Error('invalid hex');
+    out[i] = n;
+  }
+  return out;
+}
+
+export function encodeShareKey(raw) {
+  return bytesToHex(raw instanceof Uint8Array ? raw : new Uint8Array(raw));
+}
+
+export function decodeShareKey(encoded) {
+  const s = String(encoded).trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return hexToBytes(s);
+  return base64UrlToBytes(s);
 }
 
 export async function generateSourceCredentials() {
   const id = randomHex(16);
   const raw = crypto.getRandomValues(new Uint8Array(32));
   const key = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-  return { id, keyB64: bytesToBase64Url(raw), key };
+  const keyHex = encodeShareKey(raw);
+  return { id, keyHex, keyB64: keyHex, key };
 }
 
-export async function importKey(keyB64) {
-  const raw = base64UrlToBytes(keyB64);
+export async function importKey(encoded) {
+  const raw = decodeShareKey(encoded);
   if (raw.byteLength !== 32) throw new Error('encryption key must be 256 bits');
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
 }
