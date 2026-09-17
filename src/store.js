@@ -1,4 +1,11 @@
 export const STORAGE_KEY = 'p2p-watcher.sources.v1';
+// Separate key for the host page's own bookkeeping of folders *it* is seeding.
+// Kept apart from STORAGE_KEY (the viewer's list of sources it has connected
+// to) so the host page never iterates over — and never tries to reconnect
+// to — sources this browser previously *watched* as a client, and vice
+// versa. This is what lets host.html and watch/index.html be reloaded
+// independently without one page's state bleeding into the other's.
+export const HOST_STORAGE_KEY = 'p2p-watcher.hosted.v1';
 
 const ID_RE = /^[0-9a-f]{32}$/i;
 const KEY_RE = /^[A-Za-z0-9_-]{32,86}$/;
@@ -43,9 +50,9 @@ export function buildBundleUrl(originPath, sources) {
   return originPath.replace(/#.*$/, '') + buildBundleHash(sources);
 }
 
-export function loadSources(storage = globalThis.localStorage) {
+export function loadSources(storage = globalThis.localStorage, key = STORAGE_KEY) {
   try {
-    const raw = storage.getItem(STORAGE_KEY);
+    const raw = storage.getItem(key);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -55,12 +62,12 @@ export function loadSources(storage = globalThis.localStorage) {
   }
 }
 
-export function saveSources(sources, storage = globalThis.localStorage) {
-  storage.setItem(STORAGE_KEY, JSON.stringify(sources));
+export function saveSources(sources, storage = globalThis.localStorage, key = STORAGE_KEY) {
+  storage.setItem(key, JSON.stringify(sources));
 }
 
-export function upsertSources(incoming, storage = globalThis.localStorage) {
-  const existing = loadSources(storage);
+export function upsertSources(incoming, storage = globalThis.localStorage, key = STORAGE_KEY) {
+  const existing = loadSources(storage, key);
   const byId = new Map(existing.map((s) => [s.id, s]));
   for (const s of incoming) {
     if (!s || !ID_RE.test(s.id) || !KEY_RE.test(s.key)) continue;
@@ -74,21 +81,21 @@ export function upsertSources(incoming, storage = globalThis.localStorage) {
     });
   }
   const next = [...byId.values()];
-  saveSources(next, storage);
+  saveSources(next, storage, key);
   return next;
 }
 
-export function removeSource(id, storage = globalThis.localStorage) {
-  const next = loadSources(storage).filter((s) => s.id !== id);
-  saveSources(next, storage);
+export function removeSource(id, storage = globalThis.localStorage, key = STORAGE_KEY) {
+  const next = loadSources(storage, key).filter((s) => s.id !== id);
+  saveSources(next, storage, key);
   return next;
 }
 
-export function consumeHash(loc = globalThis.location, hist = globalThis.history, storage = globalThis.localStorage) {
+export function consumeHash(loc = globalThis.location, hist = globalThis.history, storage = globalThis.localStorage, key = STORAGE_KEY) {
   const parsed = parseHash(loc.hash);
   if (parsed.sources.length) {
-    upsertSources(parsed.sources, storage);
+    upsertSources(parsed.sources, storage, key);
     hist.replaceState(null, '', loc.pathname + loc.search);
   }
-  return { parsed, sources: loadSources(storage) };
+  return { parsed, sources: loadSources(storage, key) };
 }
