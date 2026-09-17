@@ -1,8 +1,16 @@
 /* p2p-watcher service worker: virtual range streaming + COOP/COEP for ffmpeg.wasm */
 const STREAM_MARK = '/virtual-stream/';
 const MAX_WINDOW = 4 * 1024 * 1024;
-const STAT_TIMEOUT = 120000;
-const READ_TIMEOUT = 120000;
+// A real .mkv/.avi remux (as opposed to the few-second test fixtures) can
+// legitimately take minutes, especially when the fallback path has to
+// re-encode rather than just copy streams into a new container. This used
+// to be 120000 (2 minutes), which is why real-world files that took longer
+// than that appeared to just "not play" with no explanation: the stat()
+// RPC below timed out and the <video> element got a bare 503 with no
+// further detail. Raised to something a real file has a real chance of
+// finishing within; see src/session.js's matching prepare() timeout.
+const STAT_TIMEOUT = 600000;
+const READ_TIMEOUT = 180000;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(self.skipWaiting());
