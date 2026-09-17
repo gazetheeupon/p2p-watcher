@@ -5,8 +5,8 @@
 // ever trying to reconnect to a library it previously watched, and lets
 // this page show real "connecting / authenticating / failed, try again"
 // status instead of a spinner that silently never updates.
-import { importKey } from '../src/crypto.js';
-import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl } from '../src/store.js';
+import { importKey } from '../src/crypto.js?v=hexkey1';
+import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl } from '../src/store.js?v=hexkey1';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js';
 import { RemoteLibrary, channelAlive } from '../src/session.js';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
