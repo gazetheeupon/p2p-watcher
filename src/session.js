@@ -131,14 +131,33 @@ export class HostLibrary {
     if (this.remuxCache.has(path)) return this.remuxCache.get(path);
     const file = this.fileMap.get(path);
     if (!file) throw new Error('not found: ' + path);
-    this.onTranscode({ path, state: 'start' });
-    const { blob, vtt } = await remuxToFragmentedMp4(file, (ratio) => this.onTranscode({ path, state: 'progress', ratio }));
-    this.remuxCache.set(path, blob);
-    const entry = this.fileEntry(path);
-    const subPath = attachEmbeddedSubtitle(entry, vtt);
-    if (subPath) this.embeddedSubs.set(subPath, vtt);
-    this.onTranscode({ path, state: 'done', size: blob.size });
-    return blob;
+    const emit = (ev) => {
+      this.onTranscode(ev);
+      this.broadcastTranscode(ev);
+    };
+    emit({ path, state: 'start' });
+    try {
+      const { blob, vtt } = await remuxToFragmentedMp4(file, (ratio) => emit({ path, state: 'progress', ratio }));
+      this.remuxCache.set(path, blob);
+      const entry = this.fileEntry(path);
+      const subPath = attachEmbeddedSubtitle(entry, vtt);
+      if (subPath) this.embeddedSubs.set(subPath, vtt);
+      emit({ path, state: 'done', size: blob.size });
+      return blob;
+    } catch (err) {
+      emit({ path, state: 'error', message: String(err.message || err) });
+      throw err;
+    }
+  }
+
+  // Pushes an unsolicited status message to every connected client so a
+  // viewer waiting on a slow remux (a full-length .mkv/.avi can take much
+  // longer than the test fixtures ever did) sees real progress instead of a
+  // silent spinner. Best-effort: a channel that isn't open yet just drops it.
+  broadcastTranscode(ev) {
+    for (const dc of this.channels) {
+      if (dc.readyState === 'open') sendJson(dc, { type: 'transcode-progress', ...ev });
+    }
   }
 
   async blobFor(path) {
@@ -182,6 +201,7 @@ export class RemoteLibrary {
     this.map = null;
     this.dead = false;
     this.onDead = null;
+    this.onTranscodeProgress = null;
     this._req = 1;
     this._pending = new Map();
     this._chunks = new Map();
@@ -288,6 +308,10 @@ export class RemoteLibrary {
     } catch {
       return;
     }
+    if (msg.type === 'transcode-progress') {
+      this.onTranscodeProgress?.(msg);
+      return;
+    }
     if (msg.type === 'read-end') {
       this._chunks.get(msg.reqId)?.end();
       return;
@@ -307,7 +331,11 @@ export class RemoteLibrary {
   }
 
   async prepare(path) {
-    return this.rpc({ type: 'prepare', path });
+    // A real .mkv/.avi can take far longer to remux than the tiny test
+    // fixtures — give this the same generous ceiling as the service
+    // worker's own stat timeout (sw.js STAT_TIMEOUT) rather than the
+    // default 60s used by every other (near-instant) RPC.
+    return this.rpc({ type: 'prepare', path }, 600000);
   }
 
   async stat(path) {
