@@ -22,7 +22,16 @@
     </div>
   </header>
 
-  <p id="status" class="status" role="status">Open a share link from someone hosting a folder to watch it here.</p>
+  <p id="status" class="status" role="status">Open a share link from someone hosting a folder to watch it here. On Fire TV, paste the link below.</p>
+
+  <section class="paste-box" id="pasteBox">
+    <label class="section-title" for="pasteUrl">Paste share link</label>
+    <p class="hint">If this page opened without the library, paste the full URL here (the one that works on your phone) and press Connect.</p>
+    <div class="paste-row">
+      <input id="pasteUrl" data-nav data-testid="paste-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…/watch.html?add=…">
+      <button id="pasteGo" class="primary" data-nav data-testid="paste-go">Connect</button>
+    </div>
+  </section>
 
   <section>
     <h2 class="section-title">Connections</h2>
@@ -81,6 +90,6 @@
   </footer>
 
   <script src="../vendor/qrcode-generator.js"></script>
-  <script type="module" src="./app.js?v=tv1"></script>
+  <script type="module" src="./app.js?v=paste1"></script>
 </body>
 </html>
