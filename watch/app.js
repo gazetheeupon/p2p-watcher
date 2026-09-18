@@ -5,8 +5,8 @@
 // ever trying to reconnect to a library it previously watched, and lets
 // this page show real "connecting / authenticating / failed, try again"
 // status instead of a spinner that silently never updates.
-import { importKey } from '../src/crypto.js?v=hexkey1';
-import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl } from '../src/store.js?v=hexkey1';
+import { importKey } from '../src/crypto.js?v=tv1';
+import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl } from '../src/store.js?v=tv1';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js';
 import { RemoteLibrary, channelAlive } from '../src/session.js';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
@@ -44,7 +44,8 @@ function log(msg, extra) {
 }
 
 function originPath() {
-  return location.origin + location.pathname;
+  if (/watch\.html$/i.test(location.pathname)) return location.origin + location.pathname;
+  return new URL('../watch.html', location.href).href.replace(/[?#].*$/, '');
 }
 
 function setState(id, status, message) {
@@ -351,7 +352,7 @@ function exposeDebug() {
     remotes: () => [...remotes.keys()].map((id) => ({ id, map: remotes.get(id)?.map })),
     merged: () => merged,
     connState: () => [...connState.entries()],
-    shareUrls: () => loadSources().map((s) => originPath() + '#add=' + s.id + ':' + s.key),
+    shareUrls: () => loadSources().map((s) => originPath() + '?add=' + s.id + '-' + s.key),
     bundleUrl: () =>
       buildBundleUrl(
         originPath(),
