@@ -64,6 +64,33 @@ h1 { margin: 0; font-size: 1.8rem; }
 .drop.drag, .drop:focus-visible { border-color: var(--accent); }
 .hint { display: block; color: var(--muted); margin-top: 0.4rem; font-size: 0.95rem; }
 
+.paste-box {
+  margin: 0 1.2rem 1.4rem;
+  padding: 1rem 1rem 1.1rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+.paste-box .section-title { margin: 0 0 0.3rem; }
+.paste-box .hint { margin: 0 0 0.8rem; }
+.paste-row {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.paste-row input {
+  flex: 1 1 240px;
+  min-height: 48px;
+  font: inherit;
+  font-size: 1.05rem;
+  padding: 0.7rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
 .section-title {
   margin: 0 1.2rem 0.6rem;
   font-size: 1.05rem;
