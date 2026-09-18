@@ -27,8 +27,23 @@ function rtcConfig() {
 }
 
 const OFFER_COUNT = 2;
-const ICE_WAIT_MS = 8000;
+const ICE_WAIT_MS = 6000;
 const OFFER_TTL_MS = 60000;
+const DC_OPTS = { negotiated: true, id: 0, ordered: true };
+
+export function stripMdnsCandidates(sdp) {
+  return String(sdp || '')
+    .split(/\r?\n/)
+    .filter((line) => {
+      if (!/^a=candidate:/i.test(line)) return true;
+      return !/\.local\b/i.test(line);
+    })
+    .join('\r\n');
+}
+
+function openChannel(pc) {
+  return pc.createDataChannel('p2p-watcher', DC_OPTS);
+}
 
 export function trackerListFromLocation(loc = globalThis.location) {
   const q = new URLSearchParams(loc.search).get('trackers');
@@ -40,18 +55,38 @@ export function trackerListFromLocation(loc = globalThis.location) {
   return [...DEFAULT_TRACKERS];
 }
 
-function waitIceComplete(pc, ms = ICE_WAIT_MS) {
+function waitForUsefulIce(pc, ms = ICE_WAIT_MS) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    const onChange = () => {
-      if (pc.iceGatheringState === 'complete') {
-        clearTimeout(t);
-        pc.removeEventListener('icegatheringstatechange', onChange);
-        resolve();
+    let finished = false;
+    let usefulTimer;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(hard);
+      clearTimeout(usefulTimer);
+      pc.removeEventListener('icecandidate', onCand);
+      pc.removeEventListener('icegatheringstatechange', onState);
+      resolve();
+    };
+    const hard = setTimeout(finish, ms);
+    const onCand = (e) => {
+      if (!e.candidate) {
+        finish();
+        return;
+      }
+      const c = e.candidate.candidate || '';
+      if (/\.local\b/i.test(c)) return;
+      if (/ typ (host|srflx|relay)/i.test(c)) {
+        clearTimeout(usefulTimer);
+        usefulTimer = setTimeout(finish, 700);
       }
     };
-    pc.addEventListener('icegatheringstatechange', onChange);
+    const onState = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    pc.addEventListener('icecandidate', onCand);
+    pc.addEventListener('icegatheringstatechange', onState);
   });
 }
 
@@ -219,12 +254,15 @@ export class Swarm {
       const offerIdBytes = crypto.getRandomValues(new Uint8Array(20));
       const offerIdHex = bytesToHex(offerIdBytes);
       const pc = new RTCPeerConnection(rtcConfig());
-      const dc = pc.createDataChannel('p2p-watcher', { ordered: true });
+      const dc = openChannel(pc);
       this._wirePc(offerIdHex, pc, dc, true);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await waitIceComplete(pc);
-      const packed = await encryptSdp(this.key, pc.localDescription);
+      await waitForUsefulIce(pc);
+      const packed = await encryptSdp(this.key, {
+        type: pc.localDescription.type,
+        sdp: stripMdnsCandidates(pc.localDescription.sdp),
+      });
       this.pendingOffers.set(offerIdHex, { pc, dc, createdAt: Date.now() });
       setTimeout(() => {
         const pending = this.pendingOffers.get(offerIdHex);
@@ -235,6 +273,21 @@ export class Swarm {
           } catch {
             /* ignore */
           }
+        }
+        // _wirePc above already added this offer's pc/dc to this.peers
+        // (keyed by offerIdHex, since we don't know who — if anyone —
+        // will answer it yet). If nobody ever did, that entry just sits
+        // there forever: only a real dc 'close' event removes a peers
+        // entry, and a dc that never opened never fires one. Over a long
+        // session (e.g. while a slow .mkv remux keeps a viewer's page
+        // open) every 8-30s re-announce leaves 2 more dead entries behind,
+        // which is why the host's "N watching" count climbs well past the
+        // number of actual viewers, and needlessly grows the list the
+        // hunt-for-an-open-peer check has to scan.
+        const rec = this.peers.get(offerIdHex);
+        if (rec && rec.dc && rec.dc.readyState !== 'open') {
+          this.peers.delete(offerIdHex);
+          this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
         }
       }, OFFER_TTL_MS);
       offers.push({
@@ -252,10 +305,7 @@ export class Swarm {
         this._scheduleReconnect();
       }
     });
-    if (dc) this._attachDc(id, pc, dc);
-    else {
-      pc.addEventListener('datachannel', (ev) => this._attachDc(id, pc, ev.channel));
-    }
+    this._attachDc(id, pc, dc || openChannel(pc));
   }
 
   _attachDc(id, pc, dc) {
@@ -331,21 +381,35 @@ export class Swarm {
   }
 
   async _onRemoteOffer({ peerIdHex, peerIdBin, offer, offerId, via }) {
-    if (this.peers.has(peerIdHex)) return;
+    const existing = this.peers.get(peerIdHex);
+    if (existing?.dc?.readyState === 'open') return;
+    if (existing) {
+      try {
+        existing.pc.close();
+      } catch {
+        /* ignore */
+      }
+      this.peers.delete(peerIdHex);
+    }
     let desc;
     try {
       desc = await decryptSdp(this.key, offer.sdp);
+      desc.sdp = stripMdnsCandidates(desc.sdp);
     } catch {
       this.log('offer decrypt failed (wrong key or foreign swarm)', { peerIdHex });
       return;
     }
     const pc = new RTCPeerConnection(rtcConfig());
-    this._wirePc(peerIdHex, pc, null, false);
+    const dc = openChannel(pc);
+    this._wirePc(peerIdHex, pc, dc, false);
     await pc.setRemoteDescription(desc);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await waitIceComplete(pc);
-    const packed = await encryptSdp(this.key, pc.localDescription);
+    await waitForUsefulIce(pc);
+    const packed = await encryptSdp(this.key, {
+      type: pc.localDescription.type,
+      sdp: stripMdnsCandidates(pc.localDescription.sdp),
+    });
     const payload = {
       action: 'announce',
       info_hash: this.infoHashBin,
@@ -376,6 +440,7 @@ export class Swarm {
     let desc;
     try {
       desc = await decryptSdp(this.key, answer.sdp);
+      desc.sdp = stripMdnsCandidates(desc.sdp);
     } catch {
       this.log('answer decrypt failed', { peerIdHex });
       return;
