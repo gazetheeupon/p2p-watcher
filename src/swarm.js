@@ -12,16 +12,23 @@ export const DEFAULT_TRACKERS = [
   'wss://tracker.openwebtorrent.com',
 ];
 
-const RTC_CONFIG = {
-  iceServers: [
+function rtcConfig() {
+  const iceServers = [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
-};
+  ];
+  const turn = typeof location !== 'undefined' && new URLSearchParams(location.search).get('turn');
+  if (turn) {
+    const [urls, username, credential] = turn.split('|');
+    if (urls) iceServers.push({ urls: urls.split(','), username: username || '', credential: credential || '' });
+  }
+  return { iceServers, iceCandidatePoolSize: 4 };
+}
 
-const OFFER_COUNT = 3;
-const ICE_WAIT_MS = 4000;
-const OFFER_TTL_MS = 50000;
+const OFFER_COUNT = 2;
+const ICE_WAIT_MS = 8000;
+const OFFER_TTL_MS = 60000;
 
 export function trackerListFromLocation(loc = globalThis.location) {
   const q = new URLSearchParams(loc.search).get('trackers');
@@ -49,12 +56,13 @@ function waitIceComplete(pc, ms = ICE_WAIT_MS) {
 }
 
 export class Swarm {
-  constructor({ sourceId, key, trackers, initiator = false, onDataChannel, onStatus, onLog }) {
+  constructor({ sourceId, key, trackers, initiator = false, onDataChannel, onChannelOpen, onStatus, onLog }) {
     this.sourceId = sourceId;
     this.key = key;
     this.trackers = trackers || trackerListFromLocation();
     this.initiator = initiator;
-    this.onDataChannel = onDataChannel;
+    this.onDataChannel = onDataChannel || (() => {});
+    this.onChannelOpen = onChannelOpen || (() => {});
     this.onStatus = onStatus || (() => {});
     this.onLog = onLog || (() => {});
     this.peerId = randomPeerId();
@@ -95,7 +103,7 @@ export class Swarm {
       this._hunt = setInterval(() => {
         const open = [...this.peers.values()].some((p) => p.dc && p.dc.readyState === 'open');
         if (!open) this.announce().catch(() => {});
-      }, 2500);
+      }, 8000);
     }
     this.onStatus({ state: 'announcing', peers: 0 });
   }
@@ -210,7 +218,7 @@ export class Swarm {
     for (let i = 0; i < n; i++) {
       const offerIdBytes = crypto.getRandomValues(new Uint8Array(20));
       const offerIdHex = bytesToHex(offerIdBytes);
-      const pc = new RTCPeerConnection(RTC_CONFIG);
+      const pc = new RTCPeerConnection(rtcConfig());
       const dc = pc.createDataChannel('p2p-watcher', { ordered: true });
       this._wirePc(offerIdHex, pc, dc, true);
       const offer = await pc.createOffer();
@@ -253,14 +261,19 @@ export class Swarm {
   _attachDc(id, pc, dc) {
     if (dc._p2pAttached) return;
     dc._p2pAttached = true;
-    dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 256 * 1024;
+    try {
+      dc.binaryType = 'arraybuffer';
+      dc.bufferedAmountLowThreshold = 256 * 1024;
+    } catch {
+      /* Silk may reject these before open */
+    }
     this.peers.set(id, { pc, dc });
     this.onDataChannel({ peerId: id, pc, dc });
     const onOpen = () => {
       if (this.destroyed) return;
       this.log('datachannel open', { id, label: dc.label });
       this.onStatus({ state: 'connected', peers: this.peers.size });
+      this.onChannelOpen({ peerId: id, pc, dc });
     };
     if (dc.readyState === 'open') onOpen();
     else dc.addEventListener('open', onOpen, { once: true });
@@ -326,7 +339,7 @@ export class Swarm {
       this.log('offer decrypt failed (wrong key or foreign swarm)', { peerIdHex });
       return;
     }
-    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const pc = new RTCPeerConnection(rtcConfig());
     this._wirePc(peerIdHex, pc, null, false);
     await pc.setRemoteDescription(desc);
     const answer = await pc.createAnswer();
