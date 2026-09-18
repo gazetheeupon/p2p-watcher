@@ -7,7 +7,7 @@
 // status instead of a spinner that silently never updates.
 import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, parsePastedShare } from '../src/store.js?v=paste1';
-import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=dc1';
+import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=dc2';
 import { RemoteLibrary, channelAlive } from '../src/session.js?v=dc1';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
 import { qrSvg } from '../src/qr.js';
