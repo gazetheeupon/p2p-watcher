@@ -29,7 +29,33 @@ function rtcConfig() {
 const OFFER_COUNT = 2;
 const ICE_WAIT_MS = 6000;
 const OFFER_TTL_MS = 60000;
+const SDP_STEP_TIMEOUT_MS = 8000;
 const DC_OPTS = { negotiated: true, id: 0, ordered: true };
+
+// pc.createOffer()/createAnswer()/setLocalDescription()/setRemoteDescription()
+// are all supposed to settle (resolve or reject) on their own, but a buggy or
+// unusual WebRTC stack can leave one pending forever instead of erroring —
+// which, with no timeout, would silently stall this connection attempt with
+// no log line ever explaining why (waitForUsefulIce has its own hard cap and
+// doesn't need this; these four calls don't). Racing every such call against
+// this timeout turns a silent, undiagnosable hang into a logged, recoverable
+// failure — this is exactly the gap that made a real Fire TV Silk failure
+// show nothing in the debug log beyond tracker connect/close noise.
+function withTimeout(promise, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${SDP_STEP_TIMEOUT_MS}ms`)), SDP_STEP_TIMEOUT_MS);
+    Promise.resolve(promise).then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
 
 export function stripMdnsCandidates(sdp) {
   return String(sdp || '')
@@ -220,6 +246,8 @@ export class Swarm {
 
   async announce(event) {
     if (this.destroyed || !this.infoHashBin) return;
+    const openSockets = [...this.sockets.values()].filter((ws) => ws.readyState === WebSocket.OPEN).length;
+    this.log('announce', { event, initiator: this.initiator, openSockets, totalSockets: this.sockets.size });
     const offers = this.initiator ? await this._generateOffers(OFFER_COUNT) : [];
     const params = {
       action: 'announce',
@@ -253,16 +281,40 @@ export class Swarm {
     for (let i = 0; i < n; i++) {
       const offerIdBytes = crypto.getRandomValues(new Uint8Array(20));
       const offerIdHex = bytesToHex(offerIdBytes);
-      const pc = new RTCPeerConnection(rtcConfig());
-      const dc = openChannel(pc);
+      this.log('generating offer', { i, of: n, offerIdHex });
+      let pc;
+      let dc;
+      try {
+        pc = new RTCPeerConnection(rtcConfig());
+        dc = openChannel(pc);
+      } catch (err) {
+        this.log('offer setup failed: could not create peer connection/data channel', { err: String(err) });
+        continue;
+      }
       const ref = this._wirePc(offerIdHex, pc, dc, true);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await waitForUsefulIce(pc);
-      const packed = await encryptSdp(this.key, {
-        type: pc.localDescription.type,
-        sdp: stripMdnsCandidates(pc.localDescription.sdp),
-      });
+      let packed;
+      try {
+        const offer = await withTimeout(pc.createOffer(), 'createOffer');
+        await withTimeout(pc.setLocalDescription(offer), 'setLocalDescription');
+        await waitForUsefulIce(pc);
+        packed = await encryptSdp(this.key, {
+          type: pc.localDescription.type,
+          sdp: stripMdnsCandidates(pc.localDescription.sdp),
+        });
+      } catch (err) {
+        // A hung (never resolving, never rejecting) createOffer/
+        // setLocalDescription used to stall this whole attempt forever with
+        // no log line — the debug panel would show nothing beyond tracker
+        // connect/close noise, indistinguishable from "never even tried".
+        this.log('offer setup failed or timed out', { offerIdHex, err: String(err) });
+        this.peers.delete(ref.key);
+        try {
+          pc.close();
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
       this.pendingOffers.set(offerIdHex, { pc, dc, ref, createdAt: Date.now() });
       setTimeout(() => {
         const pending = this.pendingOffers.get(offerIdHex);
@@ -396,6 +448,7 @@ export class Swarm {
   }
 
   async _onRemoteOffer({ peerIdHex, peerIdBin, offer, offerId, via }) {
+    this.log('received offer', { peerIdHex, via: via || 'tracker' });
     const existing = this.peers.get(peerIdHex);
     if (existing?.dc?.readyState === 'open') return;
     if (existing) {
@@ -414,17 +467,40 @@ export class Swarm {
       this.log('offer decrypt failed (wrong key or foreign swarm)', { peerIdHex });
       return;
     }
-    const pc = new RTCPeerConnection(rtcConfig());
-    const dc = openChannel(pc);
+    let pc;
+    let dc;
+    try {
+      pc = new RTCPeerConnection(rtcConfig());
+      dc = openChannel(pc);
+    } catch (err) {
+      this.log('answer setup failed: could not create peer connection/data channel', { peerIdHex, err: String(err) });
+      return;
+    }
     this._wirePc(peerIdHex, pc, dc, false);
-    await pc.setRemoteDescription(desc);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await waitForUsefulIce(pc);
-    const packed = await encryptSdp(this.key, {
-      type: pc.localDescription.type,
-      sdp: stripMdnsCandidates(pc.localDescription.sdp),
-    });
+    let packed;
+    try {
+      await withTimeout(pc.setRemoteDescription(desc), 'setRemoteDescription');
+      const answer = await withTimeout(pc.createAnswer(), 'createAnswer');
+      await withTimeout(pc.setLocalDescription(answer), 'setLocalDescription (answer)');
+      await waitForUsefulIce(pc);
+      packed = await encryptSdp(this.key, {
+        type: pc.localDescription.type,
+        sdp: stripMdnsCandidates(pc.localDescription.sdp),
+      });
+    } catch (err) {
+      // Same silent-hang risk as the offering side (see _generateOffers):
+      // without a timeout, a stuck setRemoteDescription/createAnswer here
+      // would leave an incoming connection attempt looking identical, in
+      // the debug log, to one that was never received at all.
+      this.log('answer setup failed or timed out', { peerIdHex, err: String(err) });
+      this.peers.delete(peerIdHex);
+      try {
+        pc.close();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     const payload = {
       action: 'announce',
       info_hash: this.infoHashBin,
@@ -451,7 +527,11 @@ export class Swarm {
 
   async _onRemoteAnswer({ peerIdHex, answer, offerIdHex }) {
     const pending = this.pendingOffers.get(offerIdHex);
-    if (!pending) return;
+    if (!pending) {
+      this.log('received answer for unknown/expired offer', { peerIdHex, offerIdHex });
+      return;
+    }
+    this.log('received answer', { peerIdHex, offerIdHex });
     let desc;
     try {
       desc = await decryptSdp(this.key, answer.sdp);
