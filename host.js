@@ -8,8 +8,8 @@
 // single-page app kept both roles' sources in one localStorage list, so a
 // browser that had ever done both would try to re-connect as a client
 // every time you reopened it as a host).
-import { generateSourceCredentials } from './src/crypto.js?v=hexkey1';
-import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=hexkey1';
+import { generateSourceCredentials } from './src/crypto.js?v=tv1';
+import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=tv1';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
 import { Swarm, trackerListFromLocation } from './src/swarm.js';
 import { HostLibrary } from './src/session.js';
@@ -59,13 +59,15 @@ function formatSize(n) {
   return v.toFixed(v < 10 && i ? 1 : 0) + ' ' + u[i];
 }
 
-// Share links always point at the viewer page, never at this page.
-function watchOriginPath() {
-  return new URL('./watch/', location.href).href;
+// Real file (watch.html), not /watch/ — Fire TV Silk 404s directory indexes
+// when the #fragment is dropped or glued onto the path. Query string + hyphen
+// survive URL pastes that fold case or strip hashes.
+function watchPageUrl() {
+  return new URL('./watch.html', location.href).href.replace(/[?#].*$/, '');
 }
 
 function buildWatchShareUrl(id, key) {
-  return watchOriginPath() + '#add=' + id + ':' + key;
+  return watchPageUrl() + '?add=' + String(id).toLowerCase() + '-' + String(key).toLowerCase();
 }
 
 function render() {
@@ -176,7 +178,7 @@ function showBundle() {
   const sources = loadSources(globalThis.localStorage, HOST_STORAGE_KEY);
   if (!sources.length) return;
   const url = buildBundleUrl(
-    watchOriginPath(),
+    watchPageUrl(),
     sources.map((s) => ({ id: s.id, key: s.key })),
   );
   $('bundleUrl').textContent = url;
@@ -196,7 +198,7 @@ function exposeDebug() {
     shareUrls: () => loadSources(globalThis.localStorage, HOST_STORAGE_KEY).map((s) => buildWatchShareUrl(s.id, s.key)),
     bundleUrl: () =>
       buildBundleUrl(
-        watchOriginPath(),
+        watchPageUrl(),
         loadSources(globalThis.localStorage, HOST_STORAGE_KEY).map((s) => ({ id: s.id, key: s.key })),
       ),
     peers: (id) => swarms.get(id)?.peers.size || 0,
