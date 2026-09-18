@@ -11,8 +11,8 @@
 import { generateSourceCredentials } from './src/crypto.js?v=tv1';
 import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=tv1';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
-import { Swarm, trackerListFromLocation } from './src/swarm.js';
-import { HostLibrary } from './src/session.js';
+import { Swarm, trackerListFromLocation } from './src/swarm.js?v=dc1';
+import { HostLibrary } from './src/session.js?v=dc1';
 import { bindStreamBridge, ensureServiceWorker } from './src/stream-bridge.js';
 import { qrSvg } from './src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from './src/tvnav.js';
@@ -159,7 +159,7 @@ async function startHostFromFiles(fileList, nameHint) {
     sourceId: creds.id,
     key: creds.key,
     trackers,
-    initiator: false,
+    initiator: true,
     onDataChannel: ({ dc }) => host.attachChannel(dc),
     onStatus: (st) => {
       $('status').textContent = st.state === 'connected' ? `Seeding · ${st.peers} watching` : 'Seeding (waiting for a viewer to connect)';
