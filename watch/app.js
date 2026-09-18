@@ -5,8 +5,8 @@
 // ever trying to reconnect to a library it previously watched, and lets
 // this page show real "connecting / authenticating / failed, try again"
 // status instead of a spinner that silently never updates.
-import { importKey } from '../src/crypto.js?v=tv1';
-import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl } from '../src/store.js?v=tv1';
+import { importKey } from '../src/crypto.js?v=paste1';
+import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, parsePastedShare } from '../src/store.js?v=paste1';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js';
 import { RemoteLibrary, channelAlive } from '../src/session.js';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
@@ -421,16 +421,41 @@ async function boot() {
     }
   });
 
-  async function ingestHash() {
-    const { parsed } = consumeHash();
-    if (parsed.action === 'invalid') $('status').textContent = 'That share link was malformed';
-    else if (parsed.sources.length) $('status').textContent = 'Connecting to ' + parsed.sources.length + ' source(s) from link…';
-    else if (!loadSources().length) $('status').textContent = 'Open a share link from someone hosting a folder to watch it here.';
+  function ingestParsed(parsed) {
+    if (parsed.action === 'invalid') {
+      $('status').textContent = 'Could not find an add= parameter in that text';
+      return;
+    }
+    if (parsed.sources.length) {
+      upsertSources(parsed.sources);
+      $('status').textContent = 'Connecting to ' + parsed.sources.length + ' source(s)…';
+    } else if (!loadSources().length) {
+      $('status').textContent = 'Open a share link, or paste it in the box above.';
+    }
     for (const source of loadSources()) {
       if (remotes.has(source.id) || swarms.has(source.id)) continue;
       connectRemote(source).catch((err) => log('connect failed', { err: String(err), id: source.id }));
     }
     render();
+  }
+
+  async function ingestHash() {
+    const { parsed } = consumeHash();
+    ingestParsed(parsed);
+  }
+
+  const paste = $('pasteUrl');
+  const pasteBtn = $('pasteGo');
+  if (paste && pasteBtn) {
+    const go = () => ingestParsed(parsePastedShare(paste.value));
+    pasteBtn.addEventListener('click', go);
+    paste.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        go();
+      }
+    });
+    if (!location.search.includes('add=') && !location.hash.includes('add=')) paste.focus();
   }
 
   await ingestHash();
