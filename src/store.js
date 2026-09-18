@@ -13,14 +13,31 @@ const LEGACY_KEY_RE = /^[A-Za-z0-9_-]{32,86}$/;
 
 export function parsePair(s) {
   if (typeof s !== 'string') return null;
-  const i = s.indexOf(':');
-  if (i <= 0) return null;
-  const id = s.slice(0, i).trim().toLowerCase();
-  let shareKey = s.slice(i + 1).trim();
-  if (!ID_RE.test(id)) return null;
-  if (HEX_KEY_RE.test(shareKey)) shareKey = shareKey.toLowerCase();
-  else if (!LEGACY_KEY_RE.test(shareKey)) return null;
-  return { id, key: shareKey };
+  const t = s.trim();
+  const colon = t.indexOf(':');
+  if (colon > 0) {
+    const id = t.slice(0, colon).trim().toLowerCase();
+    let shareKey = t.slice(colon + 1).trim();
+    if (!ID_RE.test(id)) return null;
+    if (HEX_KEY_RE.test(shareKey)) shareKey = shareKey.toLowerCase();
+    else if (!LEGACY_KEY_RE.test(shareKey)) return null;
+    return { id, key: shareKey };
+  }
+  const hyphen = t.match(/^([0-9a-f]{32})-([0-9a-f]{64})$/i);
+  if (hyphen) return { id: hyphen[1].toLowerCase(), key: hyphen[2].toLowerCase() };
+  return null;
+}
+
+function parsePayload(kind, payload, pairSep) {
+  if (kind === 'add') {
+    const src = parsePair(payload);
+    return src ? { action: 'add', sources: [src] } : { action: 'invalid', sources: [] };
+  }
+  if (kind === 'bundle') {
+    const sources = payload.split(pairSep).map(parsePair).filter(Boolean);
+    return { action: sources.length ? 'bundle' : 'invalid', sources };
+  }
+  return { action: 'none', sources: [] };
 }
 
 export function parseHash(hash) {
@@ -28,20 +45,27 @@ export function parseHash(hash) {
   if (!raw) return { action: 'none', sources: [] };
   const lower = raw.toLowerCase();
   const payload = raw.slice(raw.indexOf('=') + 1);
-  if (lower.startsWith('add=')) {
-    const src = parsePair(payload);
-    return src ? { action: 'add', sources: [src] } : { action: 'invalid', sources: [] };
-  }
-  if (lower.startsWith('bundle=')) {
-    const sources = payload.split('&').map(parsePair).filter(Boolean);
-    return { action: sources.length ? 'bundle' : 'invalid', sources };
-  }
+  if (lower.startsWith('add=')) return parsePayload('add', payload, '&');
+  if (lower.startsWith('bundle=')) return parsePayload('bundle', payload, '&');
+  return { action: 'none', sources: [] };
+}
+
+export function parseShareInput(hash, search) {
+  const fromHash = parseHash(hash);
+  if (fromHash.action !== 'none') return fromHash;
+  const q = new URLSearchParams(String(search || '').replace(/^\?/, ''));
+  if (q.has('add')) return parsePayload('add', q.get('add'), '~');
+  if (q.has('bundle')) return parsePayload('bundle', q.get('bundle'), '~');
   return { action: 'none', sources: [] };
 }
 
 export function buildAddHash(id, key) {
   const k = HEX_KEY_RE.test(key) ? String(key).toLowerCase() : key;
   return `#add=${String(id).toLowerCase()}:${k}`;
+}
+
+export function buildAddQuery(id, key) {
+  return `?add=${String(id).toLowerCase()}-${String(key).toLowerCase()}`;
 }
 
 export function buildBundleHash(sources) {
@@ -56,12 +80,19 @@ export function buildBundleHash(sources) {
   );
 }
 
+export function buildBundleQuery(sources) {
+  return (
+    '?bundle=' +
+    sources.map((s) => `${String(s.id).toLowerCase()}-${String(s.key).toLowerCase()}`).join('~')
+  );
+}
+
 export function buildShareUrl(originPath, id, key) {
-  return originPath.replace(/#.*$/, '') + buildAddHash(id, key);
+  return String(originPath).replace(/[?#].*$/, '') + buildAddQuery(id, key);
 }
 
 export function buildBundleUrl(originPath, sources) {
-  return originPath.replace(/#.*$/, '') + buildBundleHash(sources);
+  return String(originPath).replace(/[?#].*$/, '') + buildBundleQuery(sources);
 }
 
 export function loadSources(storage = globalThis.localStorage, key = STORAGE_KEY) {
@@ -106,11 +137,25 @@ export function removeSource(id, storage = globalThis.localStorage, key = STORAG
   return next;
 }
 
+const KEEP_QS = new Set(['nocoil', 'debug', 'trackers']);
+
+export function stripShareParams(loc = globalThis.location, hist = globalThis.history) {
+  const q = new URLSearchParams(loc.search);
+  q.delete('add');
+  q.delete('bundle');
+  const kept = new URLSearchParams();
+  for (const [k, v] of q.entries()) {
+    if (KEEP_QS.has(k)) kept.set(k, v);
+  }
+  const qs = kept.toString();
+  hist.replaceState(null, '', loc.pathname + (qs ? '?' + qs : ''));
+}
+
 export function consumeHash(loc = globalThis.location, hist = globalThis.history, storage = globalThis.localStorage, key = STORAGE_KEY) {
-  const parsed = parseHash(loc.hash);
-  if (parsed.sources.length) {
-    upsertSources(parsed.sources, storage, key);
-    hist.replaceState(null, '', loc.pathname + loc.search);
+  const parsed = parseShareInput(loc.hash, loc.search);
+  if (parsed.sources.length || parsed.action === 'invalid') {
+    if (parsed.sources.length) upsertSources(parsed.sources, storage, key);
+    stripShareParams(loc, hist);
   }
   return { parsed, sources: loadSources(storage, key) };
 }
