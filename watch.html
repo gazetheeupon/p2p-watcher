@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>P2P Watcher — Watch a Shared Folder</title>
+  <meta name="description" content="Watch a media folder someone shared with you, streamed directly from their browser over an end-to-end encrypted peer-to-peer connection.">
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="canonical" href="https://gazetheeupon.github.io/p2p-watcher/watch.html">
+  <meta name="robots" content="noindex">
+</head>
+<body>
+  <a class="skip" href="#library">Skip to library</a>
+  <p class="hub-back"><a href="./">&larr; Back to host page</a></p>
+  <header class="top">
+    <div>
+      <h1>P2P Watcher — Viewer</h1>
+      <p class="tag">This page watches; it never seeds anything itself.</p>
+    </div>
+    <div class="top-actions">
+      <button id="bundleBtn" class="primary" data-nav disabled>Forward this link</button>
+    </div>
+  </header>
+
+  <p id="status" class="status" role="status">Open a share link from someone hosting a folder to watch it here.</p>
+
+  <section>
+    <h2 class="section-title">Connections</h2>
+    <ul id="sources" class="sources"></ul>
+  </section>
+
+  <section>
+    <h2 class="section-title">Library</h2>
+    <p id="emptyState" class="empty">Nothing to watch yet. Open a share link to connect to a host.</p>
+    <div id="library" class="grid" data-testid="library"></div>
+  </section>
+
+  <div id="player" class="player" hidden>
+    <div class="player-bar">
+      <button id="backBtn" class="primary" data-nav>Back</button>
+      <h2 id="nowPlaying"></h2>
+    </div>
+    <p id="playerStatus" class="status" role="status" hidden></p>
+    <video id="video" controls playsinline hidden></video>
+  </div>
+
+  <div id="shareModal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="shareTitle">
+      <h2 id="shareTitle">Forward what you're watching</h2>
+      <p class="hint">Anyone with this link can watch the same source(s) you're currently connected to. They still connect directly to the original host, not to you.</p>
+      <div id="qr" class="qr"></div>
+      <pre id="bundleUrl" class="mono url" data-testid="bundle-url"></pre>
+      <div class="top-actions">
+        <button id="copyBundle" class="primary" data-nav>Copy link</button>
+        <button id="closeShare" class="ghost" data-nav>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <pre id="log" class="log" hidden></pre>
+
+  <div class="faq-card">
+    <h2>Troubleshooting</h2>
+    <details>
+      <summary>Stuck on "Connecting…"</summary>
+      <p>Press the &times; Cancel button next to that connection to stop trying, then use Retry. If it keeps failing, the host's tab may have been closed, or the two networks may not be able to reach each other directly (some restrictive routers/firewalls block this) &mdash; there's no relay fallback if that happens.</p>
+    </details>
+    <details>
+      <summary>A video won't start playing</summary>
+      <p>For a <code>.mkv</code>/<code>.avi</code> file, the host has to prepare it first the first time anyone watches it &mdash; the status line will say so and show progress. That can take a while for a large file. If playback still fails after that finishes, the file's codec likely isn't one this browser can decode.</p>
+    </details>
+  </div>
+
+  <footer>
+    <p>You are permanently read-only here &mdash; this page can never write to the host's device.</p>
+    <p><a href="https://gazetheeupon.github.io/">RunLocal</a> &mdash; free tools that run entirely in your browser.</p>
+  </footer>
+
+  <script src="./vendor/qrcode-generator.js"></script>
+  <script type="module" src="./watch/app.js?v=tv1"></script>
+</body>
+</html>
