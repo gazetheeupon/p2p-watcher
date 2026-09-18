@@ -255,7 +255,7 @@ export class Swarm {
       const offerIdHex = bytesToHex(offerIdBytes);
       const pc = new RTCPeerConnection(rtcConfig());
       const dc = openChannel(pc);
-      this._wirePc(offerIdHex, pc, dc, true);
+      const ref = this._wirePc(offerIdHex, pc, dc, true);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await waitForUsefulIce(pc);
@@ -263,7 +263,7 @@ export class Swarm {
         type: pc.localDescription.type,
         sdp: stripMdnsCandidates(pc.localDescription.sdp),
       });
-      this.pendingOffers.set(offerIdHex, { pc, dc, createdAt: Date.now() });
+      this.pendingOffers.set(offerIdHex, { pc, dc, ref, createdAt: Date.now() });
       setTimeout(() => {
         const pending = this.pendingOffers.get(offerIdHex);
         if (pending) {
@@ -274,19 +274,21 @@ export class Swarm {
             /* ignore */
           }
         }
-        // _wirePc above already added this offer's pc/dc to this.peers
-        // (keyed by offerIdHex, since we don't know who — if anyone —
-        // will answer it yet). If nobody ever did, that entry just sits
-        // there forever: only a real dc 'close' event removes a peers
-        // entry, and a dc that never opened never fires one. Over a long
-        // session (e.g. while a slow .mkv remux keeps a viewer's page
-        // open) every 8-30s re-announce leaves 2 more dead entries behind,
-        // which is why the host's "N watching" count climbs well past the
-        // number of actual viewers, and needlessly grows the list the
-        // hunt-for-an-open-peer check has to scan.
-        const rec = this.peers.get(offerIdHex);
+        // _wirePc above already added this offer's pc/dc to this.peers,
+        // keyed through `ref` (initially ref.key === offerIdHex, since we
+        // don't know who — if anyone — will answer it yet). If the offer
+        // was answered, _onRemoteAnswer re-keys `ref` to the real peer id,
+        // so `ref.key` no longer equals `offerIdHex` here and this block
+        // is a correct no-op. If nobody ever answered, ref.key is still
+        // offerIdHex and, unless the channel separately reached 'open',
+        // the entry is dead: only a real dc 'close' event otherwise
+        // removes a peers entry, and a dc that never opened never fires
+        // one. Over a long session every 8-30s re-announce would leave 2
+        // more dead entries behind, which is why the host's "N watching"
+        // count climbed well past the number of actual viewers.
+        const rec = this.peers.get(ref.key);
         if (rec && rec.dc && rec.dc.readyState !== 'open') {
-          this.peers.delete(offerIdHex);
+          this.peers.delete(ref.key);
           this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
         }
       }, OFFER_TTL_MS);
@@ -299,16 +301,29 @@ export class Swarm {
   }
 
   _wirePc(id, pc, dc, initiator) {
+    // `ref` is a mutable handle on this connection's current key in
+    // `this.peers`. For an outgoing offer (see _generateOffers) the key
+    // starts as the random offer id, since we don't yet know which remote
+    // peer (if any) will answer it; _onRemoteAnswer later updates
+    // `ref.key` to the real peer id once we do. Every place that needs to
+    // remove or look up this connection's peers entry goes through
+    // `ref.key` rather than a value captured at attach time — otherwise,
+    // after that re-key, the dc 'close' listener below (bound once, here)
+    // would delete the stale offer-id key and leave the real, re-keyed
+    // entry orphaned in `this.peers` forever, permanently inflating the
+    // "N watching" count by one for every connection that ever closes.
+    const ref = { key: id };
     pc.addEventListener('connectionstatechange', () => {
-      this.log('pc state', { id, state: pc.connectionState, initiator });
+      this.log('pc state', { id: ref.key, state: pc.connectionState, initiator });
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
         this._scheduleReconnect();
       }
     });
-    this._attachDc(id, pc, dc || openChannel(pc));
+    this._attachDc(ref, pc, dc || openChannel(pc));
+    return ref;
   }
 
-  _attachDc(id, pc, dc) {
+  _attachDc(ref, pc, dc) {
     if (dc._p2pAttached) return;
     dc._p2pAttached = true;
     try {
@@ -317,18 +332,18 @@ export class Swarm {
     } catch {
       /* Silk may reject these before open */
     }
-    this.peers.set(id, { pc, dc });
-    this.onDataChannel({ peerId: id, pc, dc });
+    this.peers.set(ref.key, { pc, dc });
+    this.onDataChannel({ peerId: ref.key, pc, dc });
     const onOpen = () => {
       if (this.destroyed) return;
-      this.log('datachannel open', { id, label: dc.label });
+      this.log('datachannel open', { id: ref.key, label: dc.label });
       this.onStatus({ state: 'connected', peers: this.peers.size });
-      this.onChannelOpen({ peerId: id, pc, dc });
+      this.onChannelOpen({ peerId: ref.key, pc, dc });
     };
     if (dc.readyState === 'open') onOpen();
     else dc.addEventListener('open', onOpen, { once: true });
     dc.addEventListener('close', () => {
-      this.peers.delete(id);
+      this.peers.delete(ref.key);
       this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
       this._scheduleReconnect();
     });
@@ -447,7 +462,22 @@ export class Swarm {
     }
     this.pendingOffers.delete(offerIdHex);
     await pending.pc.setRemoteDescription(desc);
-    this.peers.set(peerIdHex, { pc: pending.pc, dc: pending.dc });
+    // Re-key the peers entry _attachDc already created for this connection
+    // (under the random offer id, since we didn't know the remote peer's
+    // real id until now) onto the peer's real id, instead of inserting a
+    // second entry for the same pc/dc. Also repoint `pending.ref.key` so
+    // the dc 'close' listener (which reads `ref.key` fresh, not a value
+    // captured at attach time) deletes the right key later. Without this,
+    // every successfully-answered outgoing offer left two live entries in
+    // `this.peers` for one real connection — double-counting it in "N
+    // watching" — and once the connection closed, only the offer-id entry
+    // was removed, orphaning the peer-id one forever.
+    const ref = pending.ref;
+    const oldKey = ref ? ref.key : offerIdHex;
+    const rec = this.peers.get(oldKey);
+    if (rec) this.peers.delete(oldKey);
+    if (ref) ref.key = peerIdHex;
+    this.peers.set(peerIdHex, rec || { pc: pending.pc, dc: pending.dc });
   }
 }
 
