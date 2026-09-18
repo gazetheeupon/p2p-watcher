@@ -11,7 +11,7 @@
 import { generateSourceCredentials } from './src/crypto.js?v=tv1';
 import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=tv1';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
-import { Swarm, trackerListFromLocation } from './src/swarm.js?v=dc2';
+import { Swarm, trackerListFromLocation } from './src/swarm.js?v=dc3';
 import { HostLibrary } from './src/session.js?v=dc1';
 import { bindStreamBridge, ensureServiceWorker } from './src/stream-bridge.js';
 import { qrSvg } from './src/qr.js';
