@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>P2P Watcher</title>
+  <meta name="robots" content="noindex">
+</head>
+<body>
+  <p>Opening viewer…</p>
+  <script>
+    (function () {
+      var path = location.pathname || '';
+      var hash = location.hash || '';
+      var search = location.search || '';
+      var root = path.indexOf('/watch') >= 0 ? path.slice(0, path.indexOf('/watch')) : path.replace(/\/[^/]*$/, '');
+      if (!root) root = '';
+      var dest = location.origin + root + '/watch.html';
+
+      function pairFromAdd(raw) {
+        return String(raw || '').replace(/^add=/i, '').replace(':', '-');
+      }
+
+      if (/add=|bundle=/i.test(hash)) {
+        var h = hash.replace(/^#/, '');
+        if (/^add=/i.test(h)) {
+          location.replace(dest + '?add=' + pairFromAdd(h));
+          return;
+        }
+        if (/^bundle=/i.test(h)) {
+          location.replace(dest + '?bundle=' + h.slice(7).replace(/:/g, '-').replace(/&/g, '~'));
+          return;
+        }
+      }
+      if (/[?&](add|bundle)=/i.test(search)) {
+        location.replace(dest + search);
+        return;
+      }
+      var glued = path.match(/\/watch\/(?:index\.html\/?)?(add=.+|bundle=.+)$/i);
+      if (glued) {
+        var payload = decodeURIComponent(glued[1]).replace(/:/g, '-').replace(/&/g, '~');
+        location.replace(dest + '?' + payload);
+        return;
+      }
+      if (/\/watch\/?$/i.test(path) || /\/watch$/i.test(path)) {
+        location.replace(dest + search + hash);
+        return;
+      }
+      document.body.innerHTML = '<p>Page not found.</p><p><a href="' + (root || '/') + '/">P2P Watcher</a></p>';
+    })();
+  </script>
+</body>
+</html>
