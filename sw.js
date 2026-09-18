@@ -26,6 +26,9 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(handleStream(event.request, url));
     return;
   }
+  const isWatch =
+    /watch\.html$/i.test(url.pathname) || /\/watch(\/|$)/i.test(url.pathname);
+  if (isWatch) return;
   if (event.request.cache === 'only-if-cached' && event.request.mode !== 'same-origin') return;
   event.respondWith(
     fetch(event.request)
