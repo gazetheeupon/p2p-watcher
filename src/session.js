@@ -14,6 +14,22 @@ function sendJson(dc, obj) {
   if (dc.readyState === 'open') dc.send(JSON.stringify(obj));
 }
 
+function messageAsText(data) {
+  if (typeof data === 'string') return data;
+  try {
+    if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+    if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function isChunkBytes(data) {
+  const u8 = data instanceof Uint8Array ? data : data instanceof ArrayBuffer ? new Uint8Array(data) : null;
+  return !!(u8 && u8.byteLength >= 4 && u8[0] === 0x50 && u8[1] === 0x57 && u8[2] === 0x43 && u8[3] === 0x48);
+}
+
 async function waitBuffered(dc) {
   while (dc.readyState === 'open' && dc.bufferedAmount > 1_500_000) {
     await new Promise((r) => {
@@ -74,10 +90,11 @@ export class HostLibrary {
     this.channels.add(dc);
     dc.addEventListener('close', () => this.channels.delete(dc));
     dc.addEventListener('message', async (ev) => {
-      if (typeof ev.data !== 'string') return;
+      const text = messageAsText(ev.data);
+      if (text == null) return;
       let msg;
       try {
-        msg = JSON.parse(ev.data);
+        msg = JSON.parse(text);
       } catch {
         return;
       }
@@ -295,16 +312,18 @@ export class RemoteLibrary {
   }
 
   _onMessage(ev) {
-    if (typeof ev.data !== 'string') {
+    if (typeof ev.data !== 'string' && isChunkBytes(ev.data)) {
       const frame = decodeChunkFrame(ev.data);
       if (!frame) return;
       const waiter = this._chunks.get(frame.reqId);
       waiter?.push(frame.payload);
       return;
     }
+    const text = messageAsText(ev.data);
+    if (text == null) return;
     let msg;
     try {
-      msg = JSON.parse(ev.data);
+      msg = JSON.parse(text);
     } catch {
       return;
     }
