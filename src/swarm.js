@@ -29,33 +29,7 @@ function rtcConfig() {
 const OFFER_COUNT = 2;
 const ICE_WAIT_MS = 6000;
 const OFFER_TTL_MS = 60000;
-const SDP_STEP_TIMEOUT_MS = 8000;
 const DC_OPTS = { negotiated: true, id: 0, ordered: true };
-
-// pc.createOffer()/createAnswer()/setLocalDescription()/setRemoteDescription()
-// are all supposed to settle (resolve or reject) on their own, but a buggy or
-// unusual WebRTC stack can leave one pending forever instead of erroring —
-// which, with no timeout, would silently stall this connection attempt with
-// no log line ever explaining why (waitForUsefulIce has its own hard cap and
-// doesn't need this; these four calls don't). Racing every such call against
-// this timeout turns a silent, undiagnosable hang into a logged, recoverable
-// failure — this is exactly the gap that made a real Fire TV Silk failure
-// show nothing in the debug log beyond tracker connect/close noise.
-function withTimeout(promise, label) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`${label} timed out after ${SDP_STEP_TIMEOUT_MS}ms`)), SDP_STEP_TIMEOUT_MS);
-    Promise.resolve(promise).then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (err) => {
-        clearTimeout(t);
-        reject(err);
-      },
-    );
-  });
-}
 
 export function stripMdnsCandidates(sdp) {
   return String(sdp || '')
@@ -224,22 +198,11 @@ export class Swarm {
         this.announce().catch(() => {});
       });
       ws.addEventListener('message', (ev) => {
-        // Logged unconditionally, before the parse attempt below, so a
-        // message that arrives in a shape this code doesn't expect (e.g. a
-        // Blob instead of text — WebSocket.binaryType defaults to 'blob',
-        // and this socket never sets it) still shows up here instead of
-        // vanishing into the catch below with nothing to show for it.
-        this.log('tracker message', {
-          url,
-          dataType: typeof ev.data,
-          ctor: ev.data && ev.data.constructor && ev.data.constructor.name,
-          len: typeof ev.data === 'string' ? ev.data.length : ev.data && ev.data.byteLength,
-        });
         try {
           const data = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
           this._onTrackerMessage(data, url);
-        } catch (err) {
-          this.log('tracker message parse failed', { url, err: String(err) });
+        } catch {
+          /* ignore */
         }
       });
       ws.addEventListener('close', () => {
@@ -257,8 +220,6 @@ export class Swarm {
 
   async announce(event) {
     if (this.destroyed || !this.infoHashBin) return;
-    const openSockets = [...this.sockets.values()].filter((ws) => ws.readyState === WebSocket.OPEN).length;
-    this.log('announce', { event, initiator: this.initiator, openSockets, totalSockets: this.sockets.size });
     const offers = this.initiator ? await this._generateOffers(OFFER_COUNT) : [];
     const params = {
       action: 'announce',
@@ -271,29 +232,10 @@ export class Swarm {
       offers,
     };
     if (event) params.event = event;
-    let json;
-    try {
-      json = JSON.stringify(params);
-    } catch (err) {
-      this.log('announce payload could not be built', { err: String(err) });
-      return;
-    }
-    let sent = 0;
-    let sendErr = null;
+    const json = JSON.stringify(params);
     for (const [, ws] of this.sockets) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-      try {
-        ws.send(json);
-        sent++;
-      } catch (err) {
-        sendErr = String(err);
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(json);
     }
-    // Confirms whether the offers this instance just generated actually
-    // left the machine, closing the one gap the log lines above don't
-    // cover: "an offer was created" is not the same as "a peer, or even
-    // the tracker itself, ever saw it."
-    this.log('announce sent', { offerCount: offers.length, sentToSockets: sent, bytes: json.length, sendErr });
     if (this.bc) {
       for (const off of offers) {
         this.bc.postMessage({
@@ -311,41 +253,17 @@ export class Swarm {
     for (let i = 0; i < n; i++) {
       const offerIdBytes = crypto.getRandomValues(new Uint8Array(20));
       const offerIdHex = bytesToHex(offerIdBytes);
-      this.log('generating offer', { i, of: n, offerIdHex });
-      let pc;
-      let dc;
-      try {
-        pc = new RTCPeerConnection(rtcConfig());
-        dc = openChannel(pc);
-      } catch (err) {
-        this.log('offer setup failed: could not create peer connection/data channel', { err: String(err) });
-        continue;
-      }
-      const ref = this._wirePc(offerIdHex, pc, dc, true);
-      let packed;
-      try {
-        const offer = await withTimeout(pc.createOffer(), 'createOffer');
-        await withTimeout(pc.setLocalDescription(offer), 'setLocalDescription');
-        await waitForUsefulIce(pc);
-        packed = await encryptSdp(this.key, {
-          type: pc.localDescription.type,
-          sdp: stripMdnsCandidates(pc.localDescription.sdp),
-        });
-      } catch (err) {
-        // A hung (never resolving, never rejecting) createOffer/
-        // setLocalDescription used to stall this whole attempt forever with
-        // no log line — the debug panel would show nothing beyond tracker
-        // connect/close noise, indistinguishable from "never even tried".
-        this.log('offer setup failed or timed out', { offerIdHex, err: String(err) });
-        this.peers.delete(ref.key);
-        try {
-          pc.close();
-        } catch {
-          /* ignore */
-        }
-        continue;
-      }
-      this.pendingOffers.set(offerIdHex, { pc, dc, ref, createdAt: Date.now() });
+      const pc = new RTCPeerConnection(rtcConfig());
+      const dc = openChannel(pc);
+      this._wirePc(offerIdHex, pc, dc, true);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForUsefulIce(pc);
+      const packed = await encryptSdp(this.key, {
+        type: pc.localDescription.type,
+        sdp: stripMdnsCandidates(pc.localDescription.sdp),
+      });
+      this.pendingOffers.set(offerIdHex, { pc, dc, createdAt: Date.now() });
       setTimeout(() => {
         const pending = this.pendingOffers.get(offerIdHex);
         if (pending) {
@@ -356,21 +274,9 @@ export class Swarm {
             /* ignore */
           }
         }
-        // _wirePc above already added this offer's pc/dc to this.peers,
-        // keyed through `ref` (initially ref.key === offerIdHex, since we
-        // don't know who — if anyone — will answer it yet). If the offer
-        // was answered, _onRemoteAnswer re-keys `ref` to the real peer id,
-        // so `ref.key` no longer equals `offerIdHex` here and this block
-        // is a correct no-op. If nobody ever answered, ref.key is still
-        // offerIdHex and, unless the channel separately reached 'open',
-        // the entry is dead: only a real dc 'close' event otherwise
-        // removes a peers entry, and a dc that never opened never fires
-        // one. Over a long session every 8-30s re-announce would leave 2
-        // more dead entries behind, which is why the host's "N watching"
-        // count climbed well past the number of actual viewers.
-        const rec = this.peers.get(ref.key);
+        const rec = this.peers.get(offerIdHex);
         if (rec && rec.dc && rec.dc.readyState !== 'open') {
-          this.peers.delete(ref.key);
+          this.peers.delete(offerIdHex);
           this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
         }
       }, OFFER_TTL_MS);
@@ -383,29 +289,16 @@ export class Swarm {
   }
 
   _wirePc(id, pc, dc, initiator) {
-    // `ref` is a mutable handle on this connection's current key in
-    // `this.peers`. For an outgoing offer (see _generateOffers) the key
-    // starts as the random offer id, since we don't yet know which remote
-    // peer (if any) will answer it; _onRemoteAnswer later updates
-    // `ref.key` to the real peer id once we do. Every place that needs to
-    // remove or look up this connection's peers entry goes through
-    // `ref.key` rather than a value captured at attach time — otherwise,
-    // after that re-key, the dc 'close' listener below (bound once, here)
-    // would delete the stale offer-id key and leave the real, re-keyed
-    // entry orphaned in `this.peers` forever, permanently inflating the
-    // "N watching" count by one for every connection that ever closes.
-    const ref = { key: id };
     pc.addEventListener('connectionstatechange', () => {
-      this.log('pc state', { id: ref.key, state: pc.connectionState, initiator });
+      this.log('pc state', { id, state: pc.connectionState, initiator });
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
         this._scheduleReconnect();
       }
     });
-    this._attachDc(ref, pc, dc || openChannel(pc));
-    return ref;
+    this._attachDc(id, pc, dc || openChannel(pc));
   }
 
-  _attachDc(ref, pc, dc) {
+  _attachDc(id, pc, dc) {
     if (dc._p2pAttached) return;
     dc._p2pAttached = true;
     try {
@@ -414,18 +307,18 @@ export class Swarm {
     } catch {
       /* Silk may reject these before open */
     }
-    this.peers.set(ref.key, { pc, dc });
-    this.onDataChannel({ peerId: ref.key, pc, dc });
+    this.peers.set(id, { pc, dc });
+    this.onDataChannel({ peerId: id, pc, dc });
     const onOpen = () => {
       if (this.destroyed) return;
-      this.log('datachannel open', { id: ref.key, label: dc.label });
+      this.log('datachannel open', { id, label: dc.label });
       this.onStatus({ state: 'connected', peers: this.peers.size });
-      this.onChannelOpen({ peerId: ref.key, pc, dc });
+      this.onChannelOpen({ peerId: id, pc, dc });
     };
     if (dc.readyState === 'open') onOpen();
     else dc.addEventListener('open', onOpen, { once: true });
     dc.addEventListener('close', () => {
-      this.peers.delete(ref.key);
+      this.peers.delete(id);
       this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
       this._scheduleReconnect();
     });
@@ -478,7 +371,6 @@ export class Swarm {
   }
 
   async _onRemoteOffer({ peerIdHex, peerIdBin, offer, offerId, via }) {
-    this.log('received offer', { peerIdHex, via: via || 'tracker' });
     const existing = this.peers.get(peerIdHex);
     if (existing?.dc?.readyState === 'open') return;
     if (existing) {
@@ -497,40 +389,17 @@ export class Swarm {
       this.log('offer decrypt failed (wrong key or foreign swarm)', { peerIdHex });
       return;
     }
-    let pc;
-    let dc;
-    try {
-      pc = new RTCPeerConnection(rtcConfig());
-      dc = openChannel(pc);
-    } catch (err) {
-      this.log('answer setup failed: could not create peer connection/data channel', { peerIdHex, err: String(err) });
-      return;
-    }
+    const pc = new RTCPeerConnection(rtcConfig());
+    const dc = openChannel(pc);
     this._wirePc(peerIdHex, pc, dc, false);
-    let packed;
-    try {
-      await withTimeout(pc.setRemoteDescription(desc), 'setRemoteDescription');
-      const answer = await withTimeout(pc.createAnswer(), 'createAnswer');
-      await withTimeout(pc.setLocalDescription(answer), 'setLocalDescription (answer)');
-      await waitForUsefulIce(pc);
-      packed = await encryptSdp(this.key, {
-        type: pc.localDescription.type,
-        sdp: stripMdnsCandidates(pc.localDescription.sdp),
-      });
-    } catch (err) {
-      // Same silent-hang risk as the offering side (see _generateOffers):
-      // without a timeout, a stuck setRemoteDescription/createAnswer here
-      // would leave an incoming connection attempt looking identical, in
-      // the debug log, to one that was never received at all.
-      this.log('answer setup failed or timed out', { peerIdHex, err: String(err) });
-      this.peers.delete(peerIdHex);
-      try {
-        pc.close();
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
+    await pc.setRemoteDescription(desc);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitForUsefulIce(pc);
+    const packed = await encryptSdp(this.key, {
+      type: pc.localDescription.type,
+      sdp: stripMdnsCandidates(pc.localDescription.sdp),
+    });
     const payload = {
       action: 'announce',
       info_hash: this.infoHashBin,
@@ -540,16 +409,8 @@ export class Swarm {
       answer: { type: 'answer', sdp: packed },
     };
     const json = JSON.stringify(payload);
-    let sent = 0;
-    let sendErr = null;
     for (const [, ws] of this.sockets) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-      try {
-        ws.send(json);
-        sent++;
-      } catch (err) {
-        sendErr = String(err);
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(json);
     }
     if (this.bc) {
       this.bc.postMessage({
@@ -560,16 +421,12 @@ export class Swarm {
         answer: { type: 'answer', sdp: packed },
       });
     }
-    this.log('answered offer', { peerIdHex, via: via || 'tracker', sentToSockets: sent, sendErr });
+    this.log('answered offer', { peerIdHex, via: via || 'tracker' });
   }
 
   async _onRemoteAnswer({ peerIdHex, answer, offerIdHex }) {
     const pending = this.pendingOffers.get(offerIdHex);
-    if (!pending) {
-      this.log('received answer for unknown/expired offer', { peerIdHex, offerIdHex });
-      return;
-    }
-    this.log('received answer', { peerIdHex, offerIdHex });
+    if (!pending) return;
     let desc;
     try {
       desc = await decryptSdp(this.key, answer.sdp);
@@ -580,22 +437,7 @@ export class Swarm {
     }
     this.pendingOffers.delete(offerIdHex);
     await pending.pc.setRemoteDescription(desc);
-    // Re-key the peers entry _attachDc already created for this connection
-    // (under the random offer id, since we didn't know the remote peer's
-    // real id until now) onto the peer's real id, instead of inserting a
-    // second entry for the same pc/dc. Also repoint `pending.ref.key` so
-    // the dc 'close' listener (which reads `ref.key` fresh, not a value
-    // captured at attach time) deletes the right key later. Without this,
-    // every successfully-answered outgoing offer left two live entries in
-    // `this.peers` for one real connection — double-counting it in "N
-    // watching" — and once the connection closed, only the offer-id entry
-    // was removed, orphaning the peer-id one forever.
-    const ref = pending.ref;
-    const oldKey = ref ? ref.key : offerIdHex;
-    const rec = this.peers.get(oldKey);
-    if (rec) this.peers.delete(oldKey);
-    if (ref) ref.key = peerIdHex;
-    this.peers.set(peerIdHex, rec || { pc: pending.pc, dc: pending.dc });
+    this.peers.set(peerIdHex, { pc: pending.pc, dc: pending.dc });
   }
 }
 
