@@ -224,11 +224,22 @@ export class Swarm {
         this.announce().catch(() => {});
       });
       ws.addEventListener('message', (ev) => {
+        // Logged unconditionally, before the parse attempt below, so a
+        // message that arrives in a shape this code doesn't expect (e.g. a
+        // Blob instead of text — WebSocket.binaryType defaults to 'blob',
+        // and this socket never sets it) still shows up here instead of
+        // vanishing into the catch below with nothing to show for it.
+        this.log('tracker message', {
+          url,
+          dataType: typeof ev.data,
+          ctor: ev.data && ev.data.constructor && ev.data.constructor.name,
+          len: typeof ev.data === 'string' ? ev.data.length : ev.data && ev.data.byteLength,
+        });
         try {
           const data = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
           this._onTrackerMessage(data, url);
-        } catch {
-          /* ignore */
+        } catch (err) {
+          this.log('tracker message parse failed', { url, err: String(err) });
         }
       });
       ws.addEventListener('close', () => {
@@ -260,10 +271,29 @@ export class Swarm {
       offers,
     };
     if (event) params.event = event;
-    const json = JSON.stringify(params);
-    for (const [, ws] of this.sockets) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(json);
+    let json;
+    try {
+      json = JSON.stringify(params);
+    } catch (err) {
+      this.log('announce payload could not be built', { err: String(err) });
+      return;
     }
+    let sent = 0;
+    let sendErr = null;
+    for (const [, ws] of this.sockets) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try {
+        ws.send(json);
+        sent++;
+      } catch (err) {
+        sendErr = String(err);
+      }
+    }
+    // Confirms whether the offers this instance just generated actually
+    // left the machine, closing the one gap the log lines above don't
+    // cover: "an offer was created" is not the same as "a peer, or even
+    // the tracker itself, ever saw it."
+    this.log('announce sent', { offerCount: offers.length, sentToSockets: sent, bytes: json.length, sendErr });
     if (this.bc) {
       for (const off of offers) {
         this.bc.postMessage({
@@ -510,8 +540,16 @@ export class Swarm {
       answer: { type: 'answer', sdp: packed },
     };
     const json = JSON.stringify(payload);
+    let sent = 0;
+    let sendErr = null;
     for (const [, ws] of this.sockets) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(json);
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try {
+        ws.send(json);
+        sent++;
+      } catch (err) {
+        sendErr = String(err);
+      }
     }
     if (this.bc) {
       this.bc.postMessage({
@@ -522,7 +560,7 @@ export class Swarm {
         answer: { type: 'answer', sdp: packed },
       });
     }
-    this.log('answered offer', { peerIdHex, via: via || 'tracker' });
+    this.log('answered offer', { peerIdHex, via: via || 'tracker', sentToSockets: sent, sendErr });
   }
 
   async _onRemoteAnswer({ peerIdHex, answer, offerIdHex }) {
