@@ -7,8 +7,8 @@
 // status instead of a spinner that silently never updates.
 import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, parsePastedShare } from '../src/store.js?v=paste1';
-import { Swarm, trackerListFromLocation } from '../src/swarm.js';
-import { RemoteLibrary, channelAlive } from '../src/session.js';
+import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=dc1';
+import { RemoteLibrary, channelAlive } from '../src/session.js?v=dc1';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
@@ -121,7 +121,7 @@ function render() {
         st.status === 'connected'
           ? 'Connected'
           : st.status === 'authenticating'
-            ? 'Peer found, authenticating…'
+            ? 'Channel open, authenticating…'
             : st.status === 'error'
               ? 'Couldn’t connect'
               : st.status === 'idle'
@@ -138,7 +138,7 @@ function render() {
         <div>
           <strong>${escapeHtml(name)}</strong>
           <span class="pill ${pillClass}">${escapeHtml(label)}</span>
-          ${st.status === 'error' && st.message ? `<div class="muted">${escapeHtml(st.message)}</div>` : ''}
+          ${st.message ? `<div class="muted">${escapeHtml(st.message)}</div>` : ''}
         </div>
         <div class="top-actions">
           ${showCancel ? `<button class="ghost danger" data-nav data-cancel="${escapeHtml(s.id)}" aria-label="Stop trying to connect">&times; Cancel</button>` : ''}
@@ -176,6 +176,8 @@ function render() {
 // state instead of leaving it stuck on "Connecting…" forever. This is the
 // "red X" control.
 function cancelConnect(id) {
+  clearTimeout(connectWatchdogs.get(id));
+  connectWatchdogs.delete(id);
   const swarm = swarms.get(id);
   swarm?.destroy();
   swarms.delete(id);
@@ -272,54 +274,67 @@ function closePlayer() {
 }
 
 const connectingGuard = new Set();
+const connectWatchdogs = new Map();
 
 async function connectRemote(source) {
-  if (swarms.has(source.id) || connectingGuard.has(source.id)) return;
-  connectingGuard.add(source.id);
+  if (swarms.has(source.id)) return;
   setState(source.id, 'connecting', '');
   let settled = false;
+  clearTimeout(connectWatchdogs.get(source.id));
+  const watchdog = setTimeout(() => {
+    if (!channelAlive(remotes.get(source.id))) {
+      setState(
+        source.id,
+        'error',
+        'No WebRTC data channel opened. Same Wi-Fi helps; some routers block peer-to-peer. Leave this page open and retry.',
+      );
+    }
+  }, 45000);
+  connectWatchdogs.set(source.id, watchdog);
   const swarm = new Swarm({
     sourceId: source.id,
     key: await importKey(source.key),
     trackers,
     initiator: true,
-    onDataChannel: async ({ dc }) => {
-      if (channelAlive(remotes.get(source.id))) return;
-      setState(source.id, 'authenticating', '');
-      const key = await importKey(source.key);
-      const remote = new RemoteLibrary({ sourceId: source.id, key, dc, onLog: (e) => log(e.msg, e.extra) });
-      remote.onDead = () => {
-        if (remotes.get(source.id) === remote) {
-          remotes.delete(source.id);
-          if (currentItem && currentItem.sourceId === source.id && !$('player').hidden) {
-            resumeItem = currentItem;
-            $('playerStatus').hidden = false;
-            $('playerStatus').textContent = 'Connection dropped — reconnecting…';
+    onChannelOpen: ({ dc }) => {
+      const start = async () => {
+        if (channelAlive(remotes.get(source.id)) || connectingGuard.has(source.id)) return;
+        connectingGuard.add(source.id);
+        setState(source.id, 'authenticating', '');
+        const key = await importKey(source.key);
+        const remote = new RemoteLibrary({ sourceId: source.id, key, dc, onLog: (e) => log(e.msg, e.extra) });
+        remote.onDead = () => {
+          if (remotes.get(source.id) === remote) {
+            remotes.delete(source.id);
+            if (currentItem && currentItem.sourceId === source.id && !$('player').hidden) {
+              resumeItem = currentItem;
+              $('playerStatus').hidden = false;
+              $('playerStatus').textContent = 'Connection dropped — reconnecting…';
+            }
+            if (settled) setState(source.id, 'error', 'Connection dropped.');
           }
-          if (settled) setState(source.id, 'error', 'Connection dropped.');
+        };
+        remotes.set(source.id, remote);
+        try {
+          await remote.waitReady();
+          settled = true;
+          clearTimeout(watchdog);
+          upsertSources([{ id: source.id, key: source.key, name: remote.map?.name, role: 'client' }]);
+          setState(source.id, 'connected', '');
+          if (resumeItem && resumeItem.sourceId === source.id) {
+            const item = resumeItem;
+            resumeItem = null;
+            playItem(item).catch((err) => log('resume play failed', { err: String(err) }));
+          }
+        } catch (err) {
+          if (remotes.get(source.id) === remote) remotes.delete(source.id);
+          log('remote handshake failed', { err: String(err), id: source.id });
+          setState(source.id, 'error', String(err.message || err));
+        } finally {
+          connectingGuard.delete(source.id);
         }
       };
-      remotes.set(source.id, remote);
-      try {
-        await remote.waitReady();
-        settled = true;
-        upsertSources([{ id: source.id, key: source.key, name: remote.map?.name, role: 'client' }]);
-        setState(source.id, 'connected', '');
-        if (resumeItem && resumeItem.sourceId === source.id) {
-          const item = resumeItem;
-          resumeItem = null;
-          playItem(item).catch((err) => log('resume play failed', { err: String(err) }));
-        }
-      } catch (err) {
-        if (remotes.get(source.id) === remote) remotes.delete(source.id);
-        log('remote handshake failed', { err: String(err), id: source.id });
-        // This is the fix for the bug where the UI looked permanently stuck
-        // on "Connecting…": a failed/timed-out handshake now always tells
-        // the Sources list, instead of only logging to the console.
-        setState(source.id, 'error', String(err.message || err));
-      } finally {
-        connectingGuard.delete(source.id);
-      }
+      start();
     },
     onStatus: () => render(),
     onLog: (e) => log(e.msg, e.extra),
