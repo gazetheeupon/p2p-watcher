@@ -59,6 +59,32 @@ export function parseShareInput(hash, search) {
   return { action: 'none', sources: [] };
 }
 
+export function parsePastedShare(text) {
+  const t = String(text || '').trim();
+  if (!t) return { action: 'none', sources: [] };
+  try {
+    const u = new URL(t);
+    const parsed = parseShareInput(u.hash, u.search);
+    if (parsed.action !== 'none') return parsed;
+  } catch {
+    /* not an absolute URL */
+  }
+  const lower = t.toLowerCase();
+  const addAt = lower.lastIndexOf('add=');
+  const bundleAt = lower.lastIndexOf('bundle=');
+  if (bundleAt >= 0 && bundleAt > addAt) {
+    const payload = t.slice(bundleAt + 7).split(/\s/)[0].replace(/\/$/, '');
+    return parsePayload('bundle', payload, /[&~]/);
+  }
+  if (addAt >= 0) {
+    const payload = t.slice(addAt + 4).split(/\s/)[0].replace(/\/$/, '');
+    return parsePayload('add', payload, '~');
+  }
+  const pair = parsePair(t);
+  if (pair) return { action: 'add', sources: [pair] };
+  return { action: 'invalid', sources: [] };
+}
+
 export function buildAddHash(id, key) {
   const k = HEX_KEY_RE.test(key) ? String(key).toLowerCase() : key;
   return `#add=${String(id).toLowerCase()}:${k}`;
