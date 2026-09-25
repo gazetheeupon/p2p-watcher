@@ -190,13 +190,16 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
     const out = 'seg.mp4';
     await safeUnlink(ff, out);
     try {
-      await ff.run(
+      const durArg = String(dur);
+      // 90000 divides 24/25/30fps, and 8s of 48kHz AAC is a whole number of
+      // frames. A 2s piece is not, so each join overlapped and the picture hitched.
+      const common = [
         '-ss',
         String(Math.max(0, start)),
         '-i',
         mount.inputPath,
         '-t',
-        String(dur),
+        durArg,
         '-map',
         '0:v:0',
         '-map',
@@ -209,14 +212,32 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
         '128k',
         '-ac',
         '2',
+        '-ar',
+        '48000',
+        '-video_track_timescale',
+        '90000',
         '-avoid_negative_ts',
         'make_zero',
+        '-muxdelay',
+        '0',
+        '-muxpreload',
+        '0',
         '-f',
         'mp4',
         '-movflags',
         'frag_keyframe+empty_moov+default_base_moof',
-        out,
-      );
+      ];
+      try {
+        await ff.run(
+          ...common,
+          '-af',
+          'atrim=end=' + durArg + ',apad=whole_dur=' + durArg + ',asetpts=PTS-STARTPTS',
+          out,
+        );
+      } catch {
+        await safeUnlink(ff, out);
+        await ff.run(...common, out);
+      }
       const data = copyOut(await ff.FS('readFile', out));
       await safeUnlink(ff, out);
       return data;
