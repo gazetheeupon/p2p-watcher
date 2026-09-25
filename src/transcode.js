@@ -16,6 +16,15 @@ function withFfmpeg(fn) {
 export const LARGE_REMUX_BYTES = 256 * 1024 * 1024;
 export const SEGMENT_SECONDS = 2;
 
+const FFMPEG_JS = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js';
+const FFMPEG_WORKER = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js';
+const CORE_JS = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js';
+const CORE_WASM = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm';
+// The published loader does `new Worker(unpkg/.../814.ffmpeg.js)`. A
+// cross-origin-isolated page (required for the converter) refuses that
+// worker. Same bytes, served as a blob from this page, are allowed.
+const WORKER_CTOR = 'new Worker(new URL(e.p+e.u(814),e.b),{type:void 0})';
+
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
@@ -26,9 +35,27 @@ function loadScript(src) {
   });
 }
 
-function safeUnlink(ff, name) {
+async function loadFfmpegLibrary() {
+  if (globalThis.FFmpegWASM) return;
+  const [jsRes, workerRes] = await Promise.all([fetch(FFMPEG_JS), fetch(FFMPEG_WORKER)]);
+  if (!jsRes.ok) throw new Error('failed to load ' + FFMPEG_JS);
+  if (!workerRes.ok) throw new Error('failed to load ' + FFMPEG_WORKER);
+  const js = await jsRes.text();
+  if (!js.includes(WORKER_CTOR)) throw new Error('ffmpeg loader changed; cannot start it on this page');
+  const workerUrl = URL.createObjectURL(new Blob([await workerRes.arrayBuffer()], { type: 'text/javascript' }));
+  const patched = js.replace(WORKER_CTOR, `new Worker(${JSON.stringify(workerUrl)},{type:void 0})`);
+  await loadScript(URL.createObjectURL(new Blob([patched], { type: 'text/javascript' })));
+}
+
+async function blobUrl(url, type) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('failed to load ' + url);
+  return URL.createObjectURL(new Blob([await res.arrayBuffer()], { type }));
+}
+
+async function safeUnlink(ff, name) {
   try {
-    ff.FS('unlink', name);
+    await ff.FS('unlink', name);
   } catch {
     /* missing is fine */
   }
@@ -40,62 +67,95 @@ function copyOut(data) {
 }
 
 export async function ensureFfmpeg(onProgress) {
-  if (ffmpeg?.isLoaded?.()) return ffmpeg;
+  if (ffmpeg) return ffmpeg;
   if (loading) return loading;
   loading = (async () => {
-    if (!globalThis.FFmpeg) {
-      await loadScript('https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js');
-    }
-    const { createFFmpeg } = globalThis.FFmpeg;
-    ffmpeg = createFFmpeg({
-      log: false,
-      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+    const coreURLP = blobUrl(CORE_JS, 'text/javascript');
+    const wasmURLP = blobUrl(CORE_WASM, 'application/wasm');
+    await loadFfmpegLibrary();
+    const core = new globalThis.FFmpegWASM.FFmpeg();
+    const recent = [];
+    core.on('log', ({ message }) => {
+      if (!message) return;
+      recent.push(message);
+      if (recent.length > 12) recent.shift();
     });
     if (onProgress) {
-      ffmpeg.setProgress(({ ratio }) => {
-        if (ratio >= 0 && ratio <= 1) onProgress(ratio);
+      core.on('progress', ({ progress }) => {
+        if (progress >= 0 && progress <= 1) onProgress(progress);
       });
     }
-    await ffmpeg.load();
+    await core.load({ coreURL: await coreURLP, wasmURL: await wasmURLP });
+    ffmpeg = {
+      raw: core,
+      held: null,
+      async run(...args) {
+        const code = await core.exec(args);
+        if (code !== 0) {
+          const tail = recent.slice(-4).join(' ').replace(/\s+/g, ' ').trim();
+          throw new Error(tail || 'ffmpeg exited with code ' + code);
+        }
+      },
+      FS(method, ...args) {
+        if (method === 'readFile') return core.readFile(args[0]);
+        if (method === 'unlink') return core.deleteFile(args[0]);
+        if (method === 'writeFile') return core.writeFile(args[0], args[1]);
+        if (method === 'mkdir') return core.createDir(args[0]);
+        if (method === 'unmount') return core.unmount(args[0]);
+        throw new Error('unsupported FS method ' + method);
+      },
+      setLogger(fn) {
+        core.on('log', ({ message }) => fn({ message }));
+      },
+      async mountFile(file) {
+        const ok = await core.mount('WORKERFS', { files: [file] }, '/in');
+        if (!ok) throw new Error('Could not read this file from disk');
+      },
+      unmountIn() {
+        return core.unmount('/in');
+      },
+    };
     return ffmpeg;
   })();
   try {
     return await loading;
   } catch (err) {
     loading = null;
+    ffmpeg = null;
     throw err;
   }
 }
 
 async function mountInput(ff, file) {
   const inName = 'in' + (extOf(file.name) ? '.' + extOf(file.name) : '.mkv');
-  try {
+  // A dropped movie stays on disk. The converter reads the slices it needs
+  // (a couple of seconds at a time) instead of copying the whole file in.
+  if (typeof Blob !== 'undefined' && file instanceof Blob && file.name) {
+    const inputPath = '/in/' + file.name;
+    if (ff.held === file) return { inputPath, inName, held: true };
+    if (ff.held) {
+      try {
+        await ff.unmountIn();
+      } catch {
+        /* already gone */
+      }
+      ff.held = null;
+    }
     try {
-      ff.FS('mkdir', '/in');
+      await ff.FS('mkdir', '/in');
     } catch {
       /* exists */
     }
-    const emfs = ff.ffmpeg?.FS;
-    const workerfs = emfs?.filesystems?.WORKERFS;
-    if (workerfs && typeof File !== 'undefined' && file instanceof File) {
-      try {
-        emfs.unmount('/in');
-      } catch {
-        /* not mounted */
-      }
-      const named = new File([file], inName, { type: file.type });
-      emfs.mount(workerfs, { files: [named] }, '/in');
-      return { inputPath: '/in/' + inName, mounted: true, inName };
-    }
-  } catch {
-    /* fall through to writeFile */
+    await ff.mountFile(file);
+    ff.held = file;
+    return { inputPath, inName, held: true };
   }
   if (file.size > 64 * 1024 * 1024) {
     throw new Error('This file is too large to copy into memory');
   }
-  const { fetchFile } = globalThis.FFmpeg;
-  ff.FS('writeFile', inName, await fetchFile(file));
-  return { inputPath: inName, mounted: false, inName };
+  const buf = new Uint8Array(await file.arrayBuffer());
+  await ff.FS('writeFile', inName, buf);
+  return { inputPath: inName, inName, held: false };
 }
 
 function parseDuration(text) {
@@ -115,7 +175,7 @@ export async function probeMediaDuration(file) {
     } catch {
       /* ffmpeg exits non-zero when it is only asked to identify the file */
     } finally {
-      unmountInput(ff, mount);
+      await unmountInput(ff, mount);
     }
     const duration = parseDuration(lines.join('\n'));
     if (!duration) throw new Error('Could not read how long this file is');
@@ -128,7 +188,7 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
     const ff = await ensureFfmpeg();
     const mount = await mountInput(ff, file);
     const out = 'seg.mp4';
-    safeUnlink(ff, out);
+    await safeUnlink(ff, out);
     try {
       await ff.run(
         '-ss',
@@ -157,29 +217,20 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
         'frag_keyframe+empty_moov+default_base_moof',
         out,
       );
-      const data = copyOut(ff.FS('readFile', out));
-      safeUnlink(ff, out);
+      const data = copyOut(await ff.FS('readFile', out));
+      await safeUnlink(ff, out);
       return data;
     } finally {
-      unmountInput(ff, mount);
+      await unmountInput(ff, mount);
     }
   });
 }
 
-function unmountInput(ff, mount) {
-  if (mount.mounted) {
-    try {
-      ff.ffmpeg.FS.unmount('/in');
-    } catch {
-      try {
-        ff.FS('unmount', '/in');
-      } catch {
-        /* ignore */
-      }
-    }
-  } else {
-    safeUnlink(ff, mount.inName);
-  }
+async function unmountInput(ff, mount) {
+  // Keep a disk mount in place. The next few seconds of the same movie
+  // reuse it; a different file replaces it in mountInput.
+  if (mount.held) return;
+  await safeUnlink(ff, mount.inName);
 }
 
 export async function remuxToFragmentedMp4(file, onProgress) {
@@ -226,7 +277,7 @@ async function remuxWholeFile(file, onProgress) {
         // re-encode only the audio to AAC. Still fast — audio re-encode is
         // cheap compared to video — and fixes the single most common real
         // failure (AC-3/DTS/TrueHD audio in an otherwise-fine H.264 file).
-        safeUnlink(ff, outMp4);
+        await safeUnlink(ff, outMp4);
         await ff.run(
           '-i',
           mount.inputPath,
@@ -248,28 +299,28 @@ async function remuxWholeFile(file, onProgress) {
         // Tier 3: last resort, full re-encode. This is the slow path (can
         // legitimately take minutes for a real file) — it only runs when
         // the video stream itself can't be carried into MP4 as-is.
-        safeUnlink(ff, outMp4);
+        await safeUnlink(ff, outMp4);
         await ff.run('-i', mount.inputPath, '-c:v', 'libvpx', '-b:v', '1M', '-c:a', 'libvorbis', outWebm);
         outName = outWebm;
         mime = 'video/webm';
       }
     }
-    const data = ff.FS('readFile', outName);
+    const data = await ff.FS('readFile', outName);
     blob = new Blob([copyOut(data)], { type: mime });
-    safeUnlink(ff, outName);
+    await safeUnlink(ff, outName);
 
     let vtt = null;
     try {
       await ff.run('-i', mount.inputPath, '-map', '0:s:0', '-c:s', 'webvtt', outVtt);
-      const sub = ff.FS('readFile', outVtt);
+      const sub = await ff.FS('readFile', outVtt);
       vtt = new TextDecoder().decode(copyOut(sub));
-      safeUnlink(ff, outVtt);
+      await safeUnlink(ff, outVtt);
     } catch {
       vtt = null;
     }
     return { blob, vtt };
   } finally {
-    unmountInput(ff, mount);
+    await unmountInput(ff, mount);
   }
 }
 
