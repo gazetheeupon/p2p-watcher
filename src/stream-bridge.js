@@ -1,10 +1,28 @@
 const CHANNEL = 'p2p-watcher-stream';
+const PAGE_KEY = 'p2p-watcher.page';
+
+export function pageId() {
+  let id = sessionStorage.getItem(PAGE_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(PAGE_KEY, id);
+  }
+  return id;
+}
+
+// Host and viewer on the same computer share one BroadcastChannel. A seek
+// must be answered only by the page whose <video> asked, or the two replies
+// are stitched together and the decoder rejects the audio.
+export function answersStreamAsk(msg, mine) {
+  return !!(msg && msg.rpcId && msg.dir !== 'reply' && msg.page === mine);
+}
 
 export function bindStreamBridge(lookup) {
+  const mine = pageId();
   const ch = new BroadcastChannel(CHANNEL);
   ch.onmessage = async (event) => {
     const msg = event.data;
-    if (!msg || !msg.rpcId || msg.dir === 'reply') return;
+    if (!answersStreamAsk(msg, mine)) return;
     const { type, sourceId, path, start, end, rpcId } = msg;
     const lib = lookup(sourceId);
     if (!lib) {
@@ -32,7 +50,9 @@ export function bindStreamBridge(lookup) {
 
 export function virtualStreamUrl(sourceId, path) {
   const base = new URL('./virtual-stream/', location.href);
-  return new URL(encodeURIComponent(sourceId) + '/' + encodeURIComponent(path), base).href;
+  const url = new URL(encodeURIComponent(sourceId) + '/' + encodeURIComponent(path), base);
+  url.searchParams.set('p', pageId());
+  return url.href;
 }
 
 export async function ensureServiceWorker() {
