@@ -3,6 +3,9 @@ import { extOf, needsTranscode } from './vfs.js';
 let ffmpeg = null;
 let loading = null;
 let ffmpegChain = Promise.resolve();
+// AAC and MP3 can be copied. Re-encoding them (or shifting only the audio
+// with asetpts) moves the sound off the picture after a skip.
+const copyableAudio = new WeakMap();
 
 function withFfmpeg(fn) {
   const run = ffmpegChain.then(fn, fn);
@@ -177,7 +180,10 @@ export async function probeMediaDuration(file) {
     } finally {
       await unmountInput(ff, mount);
     }
-    const duration = parseDuration(lines.join('\n'));
+    const text = lines.join('\n');
+    const audio = /Audio:\s*([a-z0-9_]+)/i.exec(text);
+    if (audio) copyableAudio.set(file, /^(aac|mp3)$/i.test(audio[1]));
+    const duration = parseDuration(text);
     if (!duration) throw new Error('Could not read how long this file is');
     return duration;
   });
@@ -190,32 +196,23 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
     const out = 'seg.mp4';
     await safeUnlink(ff, out);
     try {
-      const durArg = String(dur);
-      // 90000 divides 24/25/30fps, and 8s of 48kHz AAC is a whole number of
-      // frames. A 2s piece is not, so each join overlapped and the picture hitched.
+      // -ss before -i lands on the previous keyframe, and -t counts from the
+      // requested time, so the piece includes that lead-in. make_zero keeps
+      // the sound and the picture on one clock. The viewer places the lead-in
+      // at the keyframe instead of at the skip point.
       const common = [
         '-ss',
         String(Math.max(0, start)),
         '-i',
         mount.inputPath,
         '-t',
-        durArg,
+        String(dur),
         '-map',
         '0:v:0',
         '-map',
         '0:a:0?',
         '-c:v',
         'copy',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-ac',
-        '2',
-        '-ar',
-        '48000',
-        '-video_track_timescale',
-        '90000',
         '-avoid_negative_ts',
         'make_zero',
         '-muxdelay',
@@ -227,16 +224,13 @@ export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
         '-movflags',
         'frag_keyframe+empty_moov+default_base_moof',
       ];
+      const encodeAudio = ['-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000'];
       try {
-        await ff.run(
-          ...common,
-          '-af',
-          'atrim=end=' + durArg + ',apad=whole_dur=' + durArg + ',asetpts=PTS-STARTPTS',
-          out,
-        );
+        if (copyableAudio.get(file) === true) await ff.run(...common, '-c:a', 'copy', out);
+        else await ff.run(...common, ...encodeAudio, out);
       } catch {
         await safeUnlink(ff, out);
-        await ff.run(...common, out);
+        await ff.run(...common, ...encodeAudio, out);
       }
       const data = copyOut(await ff.FS('readFile', out));
       await safeUnlink(ff, out);
