@@ -9,7 +9,7 @@
 // browser that had ever done both would try to re-connect as a client
 // every time you reopened it as a host).
 import { generateSourceCredentials } from './src/crypto.js?v=tv1';
-import { loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, HOST_STORAGE_KEY } from './src/store.js?v=silk2';
+import { loadSources, upsertSources, removeSource, saveSources, buildBundleUrl, buildShareUrl, HOST_STORAGE_KEY } from './src/store.js?v=silk2';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
 import { Swarm, trackerListFromLocation } from './src/swarm.js?v=lan1';
 import { HostLibrary } from './src/session.js?v=seek1';
@@ -351,6 +351,14 @@ async function boot() {
     }
   });
 
+  // A dropped folder only exists in this tab. After a reload the saved id
+  // and key are still here, but the files are not, so the old link cannot
+  // play anything. Drop the folder again to share it.
+  const stale = loadSources(globalThis.localStorage, HOST_STORAGE_KEY);
+  if (stale.length) {
+    saveSources([], globalThis.localStorage, HOST_STORAGE_KEY);
+    $('status').textContent = 'The previous share ended when this page reloaded. Drop the folder again to share it.';
+  }
   render();
   // Re-render periodically so the peer count updates live without requiring
   // a swarm status event for every tick.
