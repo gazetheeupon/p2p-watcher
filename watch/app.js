@@ -8,7 +8,7 @@
 import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, parsePastedShare } from '../src/store.js?v=silk2';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=lan1';
-import { RemoteLibrary, channelAlive } from '../src/session.js?v=seek1';
+import { RemoteLibrary, channelAlive } from '../src/session.js?v=seg1';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js?v=tv1';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
