@@ -64,6 +64,8 @@ export function parsePastedShare(text) {
   if (!t) return { action: 'none', sources: [] };
   try {
     const u = new URL(t);
+    const fromPath = parsePathShare(u.pathname);
+    if (fromPath.action !== 'none') return fromPath;
     const parsed = parseShareInput(u.hash, u.search);
     if (parsed.action !== 'none') return parsed;
   } catch {
@@ -113,12 +115,44 @@ export function buildBundleQuery(sources) {
   );
 }
 
+function shareBase(originPath) {
+  return String(originPath).replace(/[?#].*$/, '').replace(/watch\.html$/i, '');
+}
+
+// The id and key live in the path. Fire TV's remote paste drops "?", so a
+// query-string link never arrives intact. 96 hex chars: 32 id + 64 key.
 export function buildShareUrl(originPath, id, key) {
-  return String(originPath).replace(/[?#].*$/, '') + buildAddQuery(id, key);
+  return shareBase(originPath) + 'v/' + String(id).toLowerCase() + String(key).toLowerCase();
 }
 
 export function buildBundleUrl(originPath, sources) {
-  return String(originPath).replace(/[?#].*$/, '') + buildBundleQuery(sources);
+  return (
+    shareBase(originPath) +
+    'b/' +
+    sources.map((s) => String(s.id).toLowerCase() + String(s.key).toLowerCase()).join('')
+  );
+}
+
+export function parsePathShare(pathname) {
+  const path = decodeURIComponent(String(pathname || ''));
+  const one = path.match(/\/v\/([0-9a-f]{96})\/?$/i);
+  if (one) {
+    const hex = one[1].toLowerCase();
+    return { action: 'add', sources: [{ id: hex.slice(0, 32), key: hex.slice(32) }] };
+  }
+  const many = path.match(/\/b\/([0-9a-f]+)\/?$/i);
+  if (many && many[1].length >= 96 && many[1].length % 96 === 0) {
+    const hex = many[1].toLowerCase();
+    const sources = [];
+    for (let i = 0; i < hex.length; i += 96) {
+      sources.push({ id: hex.slice(i, i + 32), key: hex.slice(i + 32, i + 96) });
+    }
+    return { action: 'bundle', sources };
+  }
+  // Remote paste deleted the "?" so watch.html?add=… arrived as watch.htmladd=…
+  const glued = path.match(/watch\.htmladd=([0-9a-f]{32})-([0-9a-f]{64})/i) || path.match(/watch\.htmladd=([0-9a-f]{32})([0-9a-f]{64})/i);
+  if (glued) return { action: 'add', sources: [{ id: glued[1].toLowerCase(), key: glued[2].toLowerCase() }] };
+  return { action: 'none', sources: [] };
 }
 
 export function loadSources(storage = globalThis.localStorage, key = STORAGE_KEY) {
@@ -163,7 +197,7 @@ export function removeSource(id, storage = globalThis.localStorage, key = STORAG
   return next;
 }
 
-const KEEP_QS = new Set(['nocoil', 'debug', 'trackers']);
+const KEEP_QS = new Set(['nocoil', 'debug', 'trackers', 'wan']);
 
 export function stripShareParams(loc = globalThis.location, hist = globalThis.history) {
   const q = new URLSearchParams(loc.search);
