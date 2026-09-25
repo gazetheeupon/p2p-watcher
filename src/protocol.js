@@ -1,6 +1,6 @@
 export const MAGIC = new Uint8Array([0x50, 0x57, 0x43, 0x48]); // PWCH
 export const WRITE_TYPES = new Set(['write', 'delete', 'put', 'mkdir', 'move', 'unlink', 'truncate', 'rename']);
-export const ALLOWED_CLIENT_TO_HOST = new Set(['auth', 'get-map', 'prepare', 'read', 'ping', 'get-text']);
+export const ALLOWED_CLIENT_TO_HOST = new Set(['auth', 'get-map', 'prepare', 'read', 'segment', 'ping', 'get-text']);
 export const DEFAULT_RANGE_WINDOW = 1 * 1024 * 1024;
 export const MAX_RANGE_WINDOW = 4 * 1024 * 1024;
 export const DATA_CHUNK = 16 * 1024;
@@ -97,6 +97,14 @@ export async function dispatchHostControl(msg, ctx) {
     }
     case 'read':
       return { type: 'read-go', reqId: msg.reqId, path: msg.path, start: msg.start, end: msg.end };
+    case 'segment':
+      return {
+        type: 'segment-go',
+        reqId: msg.reqId,
+        path: msg.path,
+        start: Number(msg.start) || 0,
+        dur: Number(msg.dur) || 2,
+      };
     default:
       return { type: 'error', message: 'unsupported' };
   }
