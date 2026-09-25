@@ -18,6 +18,7 @@
       <p class="tag">This page watches; it never seeds anything itself.</p>
     </div>
     <div class="top-actions">
+      <button id="logBtn" class="ghost" data-nav type="button">Connection log</button>
       <button id="bundleBtn" class="primary" data-nav disabled>Forward this link</button>
     </div>
   </header>
@@ -28,7 +29,7 @@
     <label class="section-title" for="pasteUrl">Paste share link</label>
     <p class="hint">If this page opened without the library, paste the full URL here (the one that works on your phone) and press Connect.</p>
     <div class="paste-row">
-      <input id="pasteUrl" data-nav data-testid="paste-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…/watch.html?add=…">
+      <input id="pasteUrl" data-nav data-testid="paste-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…/v/…">
       <button id="pasteGo" class="primary" data-nav data-testid="paste-go">Connect</button>
     </div>
   </section>
@@ -90,6 +91,6 @@
   </footer>
 
   <script src="../vendor/qrcode-generator.js"></script>
-  <script type="module" src="./app.js?v=dc3"></script>
+  <script type="module" src="./app.js?v=silk2"></script>
 </body>
 </html>
