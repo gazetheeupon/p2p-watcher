@@ -8,7 +8,7 @@ import {
 } from './protocol.js';
 import { mimeOf, needsTranscode, streamMime } from './vfs.js';
 import { srtToVtt, attachEmbeddedSubtitle } from './subtitles.js';
-import { remuxToFragmentedMp4 } from './transcode.js?v=seek1';
+import { remuxToFragmentedMp4, probeMediaDuration, remuxSegment, LARGE_REMUX_BYTES } from './transcode.js?v=seek1';
 
 function sendJson(dc, obj) {
   if (dc.readyState === 'open') dc.send(JSON.stringify(obj));
@@ -76,6 +76,7 @@ export class HostLibrary {
     this.onTranscode = onTranscode || (() => {});
     this.onLog = onLog || (() => {});
     this.remuxCache = new Map();
+    this.segmentCache = new Map();
     this.embeddedSubs = new Map();
     this.channels = new Set();
   }
@@ -112,6 +113,11 @@ export class HostLibrary {
           await sendBlobRange(dc, reply.reqId, blob, reply.start, reply.end);
           return;
         }
+        if (reply.type === 'segment-go') {
+          const bytes = await this.segmentBytes(reply.path, reply.start, reply.dur);
+          await sendBlobRange(dc, reply.reqId, new Blob([bytes]), 0, bytes.byteLength - 1);
+          return;
+        }
         sendJson(dc, reply);
       } catch (err) {
         sendJson(dc, { type: 'error', reqId: msg.reqId, message: String(err.message || err) });
@@ -139,6 +145,29 @@ export class HostLibrary {
     const file = this.fileMap.get(path);
     if (!file) throw new Error('not found: ' + path);
     if (needsTranscode(path, mimeOf(file))) {
+      const forceSegments = new URLSearchParams(location.search).has('seg');
+      if (forceSegments || file.size > LARGE_REMUX_BYTES) {
+        const emit = (ev) => {
+          this.onTranscode(ev);
+          this.broadcastTranscode(ev);
+        };
+        emit({ path, state: 'start' });
+        try {
+          const duration = await probeMediaDuration(file);
+          emit({ path, state: 'done', size: file.size });
+          return {
+            path,
+            size: file.size,
+            mime: 'video/mp4',
+            segmented: true,
+            duration,
+            subtitles: [],
+          };
+        } catch (err) {
+          emit({ path, state: 'error', message: String(err.message || err) });
+          throw err;
+        }
+      }
       const blob = await this.ensureRemux(path);
       return { path, size: blob.size, mime: blob.type, subtitles: this.fileEntry(path)?.subtitles || [] };
     }
@@ -176,6 +205,18 @@ export class HostLibrary {
     for (const dc of this.channels) {
       if (dc.readyState === 'open') sendJson(dc, { type: 'transcode-progress', ...ev });
     }
+  }
+
+  async segmentBytes(path, start, dur) {
+    const key = path + ':' + start + ':' + dur;
+    const cached = this.segmentCache.get(key);
+    if (cached) return cached;
+    const file = this.fileMap.get(path);
+    if (!file) throw new Error('not found: ' + path);
+    const bytes = await remuxSegment(file, start, dur);
+    this.segmentCache.set(key, bytes);
+    if (this.segmentCache.size > 4) this.segmentCache.delete(this.segmentCache.keys().next().value);
+    return bytes;
   }
 
   async blobFor(path) {
@@ -367,6 +408,53 @@ export class RemoteLibrary {
     // worker's own stat timeout (sw.js STAT_TIMEOUT) rather than the
     // default 60s used by every other (near-instant) RPC.
     return this.rpc({ type: 'prepare', path }, 600000);
+  }
+
+  async segment(path, start, dur) {
+    const reqId = nextReqId(this._req++);
+    const queue = [];
+    let notify;
+    const waiter = {
+      push(c) {
+        queue.push(c);
+        notify?.();
+      },
+      end() {
+        waiter.done = true;
+        notify?.();
+      },
+      fail(err) {
+        waiter.err = err;
+        notify?.();
+      },
+    };
+    this._chunks.set(reqId, waiter);
+    sendJson(this.dc, { type: 'segment', reqId, path, start, dur });
+    const parts = [];
+    try {
+      while (true) {
+        if (waiter.err) throw waiter.err;
+        if (queue.length) {
+          parts.push(queue.shift());
+          continue;
+        }
+        if (waiter.done) break;
+        await new Promise((r) => {
+          notify = r;
+        });
+      }
+    } finally {
+      this._chunks.delete(reqId);
+    }
+    let len = 0;
+    for (const p of parts) len += p.byteLength;
+    const out = new Uint8Array(len);
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.byteLength;
+    }
+    return out;
   }
 
   async stat(path) {
