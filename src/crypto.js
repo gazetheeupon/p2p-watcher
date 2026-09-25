@@ -59,6 +59,32 @@ export async function importKey(encoded) {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
 }
 
+// One byte of type, then the message, then AES-GCM. The relay only ever
+// forwards this ciphertext, so it cannot read filenames or file bytes.
+export async function sealRelayPayload(key, data) {
+  const body = typeof data === 'string' ? enc.encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
+  const plain = new Uint8Array(1 + body.byteLength);
+  plain[0] = typeof data === 'string' ? 1 : 2;
+  plain.set(body, 1);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain));
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv, 0);
+  out.set(ct, 12);
+  return out;
+}
+
+export async function openRelayPayload(key, sealed) {
+  const bytes = sealed instanceof Uint8Array ? sealed : new Uint8Array(sealed);
+  if (bytes.byteLength < 13) throw new Error('relay payload too short');
+  const iv = bytes.subarray(0, 12);
+  const ct = bytes.subarray(12);
+  const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+  if (plain[0] === 1) return dec.decode(plain.subarray(1));
+  if (plain[0] === 2) return plain.subarray(1).slice();
+  throw new Error('relay payload type');
+}
+
 export async function encryptJson(key, obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
