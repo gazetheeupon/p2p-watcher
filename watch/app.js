@@ -6,12 +6,13 @@
 // this page show real "connecting / authenticating / failed, try again"
 // status instead of a spinner that silently never updates.
 import { importKey } from '../src/crypto.js?v=paste1';
-import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, parsePastedShare } from '../src/store.js?v=paste1';
-import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=dc3';
-import { RemoteLibrary, channelAlive } from '../src/session.js?v=dc1';
+import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, parsePastedShare } from '../src/store.js?v=silk2';
+import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=lan1';
+import { RemoteLibrary, channelAlive } from '../src/session.js?v=lan1';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
+import { connectViewerRelay, isSilk, relayAvailable } from '../src/relay.js?v=silk2';
 
 const logs = [];
 const remotes = new Map();
@@ -28,19 +29,22 @@ let resumeItem = null;
 
 const $ = (id) => document.getElementById(id);
 
+const LOG_LEGEND =
+  'mdns = Wi-Fi name (Fire TV often cannot use it). host = real local IP. public = internet address. relay = none configured.';
+
 function log(msg, extra) {
-  const entry = { t: Date.now(), msg, extra };
-  logs.push(entry);
-  if (logs.length > 200) logs.shift();
+  const text = extra ? msg + ' ' + (typeof extra === 'string' ? extra : JSON.stringify(extra)) : String(msg);
+  if (logs[logs.length - 1] === text) return;
+  logs.push(text);
+  if (logs.length > 16) logs.shift();
+  paintLog();
+  console.log('[p2p-watcher:watch]', text);
+}
+
+function paintLog() {
   const el = $('log');
-  if (el && new URLSearchParams(location.search).has('debug')) {
-    el.hidden = false;
-    el.textContent = logs
-      .slice(-40)
-      .map((l) => l.msg + (l.extra ? ' ' + JSON.stringify(l.extra) : ''))
-      .join('\n');
-  }
-  console.log('[p2p-watcher:watch]', msg, extra || '');
+  if (!el || el.hidden) return;
+  el.textContent = [LOG_LEGEND, ...logs.slice(-12)].join('\n');
 }
 
 function originPath() {
@@ -275,69 +279,96 @@ function closePlayer() {
 
 const connectingGuard = new Set();
 const connectWatchdogs = new Map();
+let transportKind = 'webrtc';
 
-async function connectRemote(source) {
-  if (swarms.has(source.id)) return;
-  setState(source.id, 'connecting', '');
-  let settled = false;
+function armWatchdog(source) {
   clearTimeout(connectWatchdogs.get(source.id));
   const watchdog = setTimeout(() => {
     if (!channelAlive(remotes.get(source.id))) {
       setState(
         source.id,
         'error',
-        'No WebRTC data channel opened. Same Wi-Fi helps; some routers block peer-to-peer. Leave this page open and retry.',
+        'No connection opened. On a computer or phone, both devices need the same Wi-Fi. On Fire TV, open the link that shows this computer’s address.',
       );
     }
   }, 45000);
   connectWatchdogs.set(source.id, watchdog);
+  return watchdog;
+}
+
+async function beginRemote(source, dc, watchdog) {
+  if (channelAlive(remotes.get(source.id)) || connectingGuard.has(source.id)) return;
+  connectingGuard.add(source.id);
+  setState(source.id, 'authenticating', '');
+  let settled = false;
+  const key = await importKey(source.key);
+  const remote = new RemoteLibrary({ sourceId: source.id, key, dc, onLog: (e) => log(e.msg) });
+  remote.onDead = () => {
+    if (remotes.get(source.id) === remote) {
+      remotes.delete(source.id);
+      if (currentItem && currentItem.sourceId === source.id && !$('player').hidden) {
+        resumeItem = currentItem;
+        $('playerStatus').hidden = false;
+        $('playerStatus').textContent = 'Connection dropped — reconnecting…';
+      }
+      if (settled) setState(source.id, 'error', 'Connection dropped.');
+    }
+  };
+  remotes.set(source.id, remote);
+  try {
+    await remote.waitReady();
+    settled = true;
+    clearTimeout(watchdog);
+    upsertSources([{ id: source.id, key: source.key, name: remote.map?.name, role: 'client' }]);
+    setState(source.id, 'connected', '');
+    if (resumeItem && resumeItem.sourceId === source.id) {
+      const item = resumeItem;
+      resumeItem = null;
+      playItem(item).catch((err) => log('resume play failed: ' + String(err.message || err)));
+    }
+  } catch (err) {
+    if (remotes.get(source.id) === remote) remotes.delete(source.id);
+    try {
+      dc.close();
+    } catch {
+      /* already closed */
+    }
+    clearTimeout(watchdog);
+    log('handshake failed: ' + String(err.message || err));
+    setState(source.id, 'error', String(err.message || err));
+  } finally {
+    connectingGuard.delete(source.id);
+  }
+}
+
+async function connectRemote(source) {
+  if (swarms.has(source.id) || remotes.has(source.id)) return;
+  setState(source.id, 'connecting', '');
+  const watchdog = armWatchdog(source);
+  if (isSilk()) {
+    const wan = new URLSearchParams(location.search).has('wan');
+    const localRelay = !wan && (await relayAvailable());
+    transportKind = localRelay ? 'relay' : 'public-relay';
+    log(localRelay ? 'silk using relay' : 'silk using public relay');
+    try {
+      const dc = await connectViewerRelay(source.id, { public: !localRelay, key: await importKey(source.key) });
+      await beginRemote(source, dc, watchdog);
+    } catch (err) {
+      log('relay failed: ' + String(err.message || err));
+      setState(source.id, 'error', 'Could not reach the computer serving this page.');
+    }
+    return;
+  }
   const swarm = new Swarm({
     sourceId: source.id,
     key: await importKey(source.key),
     trackers,
     initiator: true,
     onChannelOpen: ({ dc }) => {
-      const start = async () => {
-        if (channelAlive(remotes.get(source.id)) || connectingGuard.has(source.id)) return;
-        connectingGuard.add(source.id);
-        setState(source.id, 'authenticating', '');
-        const key = await importKey(source.key);
-        const remote = new RemoteLibrary({ sourceId: source.id, key, dc, onLog: (e) => log(e.msg, e.extra) });
-        remote.onDead = () => {
-          if (remotes.get(source.id) === remote) {
-            remotes.delete(source.id);
-            if (currentItem && currentItem.sourceId === source.id && !$('player').hidden) {
-              resumeItem = currentItem;
-              $('playerStatus').hidden = false;
-              $('playerStatus').textContent = 'Connection dropped — reconnecting…';
-            }
-            if (settled) setState(source.id, 'error', 'Connection dropped.');
-          }
-        };
-        remotes.set(source.id, remote);
-        try {
-          await remote.waitReady();
-          settled = true;
-          clearTimeout(watchdog);
-          upsertSources([{ id: source.id, key: source.key, name: remote.map?.name, role: 'client' }]);
-          setState(source.id, 'connected', '');
-          if (resumeItem && resumeItem.sourceId === source.id) {
-            const item = resumeItem;
-            resumeItem = null;
-            playItem(item).catch((err) => log('resume play failed', { err: String(err) }));
-          }
-        } catch (err) {
-          if (remotes.get(source.id) === remote) remotes.delete(source.id);
-          log('remote handshake failed', { err: String(err), id: source.id });
-          setState(source.id, 'error', String(err.message || err));
-        } finally {
-          connectingGuard.delete(source.id);
-        }
-      };
-      start();
+      beginRemote(source, dc, watchdog);
     },
     onStatus: () => render(),
-    onLog: (e) => log(e.msg, e.extra),
+    onLog: (e) => log(e.msg),
   });
   swarms.set(source.id, swarm);
   await swarm.start();
@@ -367,7 +398,7 @@ function exposeDebug() {
     remotes: () => [...remotes.keys()].map((id) => ({ id, map: remotes.get(id)?.map })),
     merged: () => merged,
     connState: () => [...connState.entries()],
-    shareUrls: () => loadSources().map((s) => originPath() + '?add=' + s.id + '-' + s.key),
+    shareUrls: () => loadSources().map((s) => buildShareUrl(originPath(), s.id, s.key)),
     bundleUrl: () =>
       buildBundleUrl(
         originPath(),
@@ -377,6 +408,7 @@ function exposeDebug() {
     virtualStreamUrl,
     controller: () => navigator.serviceWorker.controller?.scriptURL || null,
     channelAlive: (id) => channelAlive(id ? remotes.get(id) : [...remotes.values()][0]),
+    transport: () => transportKind,
     cancelConnect,
     killRemote(id) {
       const r = id ? remotes.get(id) : [...remotes.values()][0];
@@ -424,6 +456,15 @@ async function boot() {
     if (!$('player').hidden) closePlayer();
   });
   $('backBtn').addEventListener('click', closePlayer);
+  $('logBtn')?.addEventListener('click', () => {
+    const el = $('log');
+    el.hidden = !el.hidden;
+    if (!el.hidden) paintLog();
+  });
+  if (new URLSearchParams(location.search).has('debug')) {
+    $('log').hidden = false;
+    paintLog();
+  }
   $('bundleBtn').addEventListener('click', showBundle);
   $('closeShare').addEventListener('click', () => {
     $('shareModal').hidden = true;
