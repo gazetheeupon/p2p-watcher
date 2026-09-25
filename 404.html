@@ -9,15 +9,53 @@
   <p>Opening viewer…</p>
   <script>
     (function () {
-      var path = location.pathname || '';
+      var path = decodeURIComponent(location.pathname || '');
       var hash = location.hash || '';
       var search = location.search || '';
-      var root = path.indexOf('/watch') >= 0 ? path.slice(0, path.indexOf('/watch')) : path.replace(/\/[^/]*$/, '');
+      var cut = path.search(/\/v\/[0-9a-f]{96}/i);
+      if (cut < 0) cut = path.search(/\/b\/[0-9a-f]{96}/i);
+      var root = cut >= 0
+        ? path.slice(0, cut)
+        : path.indexOf('/watch') >= 0
+          ? path.slice(0, path.indexOf('/watch'))
+          : path.replace(/\/[^/]*$/, '');
       if (!root) root = '';
       var dest = location.origin + root + '/watch.html';
+      var keep = new URLSearchParams();
+      var incoming = new URLSearchParams(search);
+      ['nocoil', 'debug', 'wan', 'trackers'].forEach(function (k) {
+        if (incoming.has(k)) keep.set(k, incoming.get(k));
+      });
+      function withKeep(query) {
+        var extra = keep.toString();
+        if (!extra) return query;
+        return query + (query.indexOf('?') >= 0 ? '&' : '?') + extra;
+      }
 
       function pairFromAdd(raw) {
         return String(raw || '').replace(/^add=/i, '').replace(':', '-');
+      }
+
+      var pathPair = path.match(/\/v\/([0-9a-f]{96})\/?$/i);
+      if (pathPair) {
+        var hex = pathPair[1].toLowerCase();
+        location.replace(withKeep(dest + '?add=' + hex.slice(0, 32) + '-' + hex.slice(32)));
+        return;
+      }
+      var pathBundle = path.match(/\/b\/([0-9a-f]+)\/?$/i);
+      if (pathBundle && pathBundle[1].length >= 96 && pathBundle[1].length % 96 === 0) {
+        var packed = pathBundle[1].toLowerCase();
+        var parts = [];
+        for (var i = 0; i < packed.length; i += 96) {
+          parts.push(packed.slice(i, i + 32) + '-' + packed.slice(i + 32, i + 96));
+        }
+        location.replace(withKeep(dest + '?bundle=' + parts.join('~')));
+        return;
+      }
+      var dropped = path.match(/watch\.htmladd=([0-9a-f]{32})-([0-9a-f]{64})/i) || path.match(/watch\.htmladd=([0-9a-f]{32})([0-9a-f]{64})/i);
+      if (dropped) {
+        location.replace(withKeep(dest + '?add=' + dropped[1].toLowerCase() + '-' + dropped[2].toLowerCase()));
+        return;
       }
 
       if (/add=|bundle=/i.test(hash)) {
