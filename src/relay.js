@@ -57,7 +57,9 @@ class SocketChannel {
     this.readyState = 'open';
     // Fewer, larger messages so a deployed relay stays inside a free quota
     // while a movie is playing. WebRTC keeps the smaller DATA_CHUNK.
-    this.relayChunk = 128 * 1024;
+    // Small enough that sealing one piece (plain bytes, ciphertext, and the
+    // base64 copy) stays modest on a Fire TV stick. The relay is Silk-only.
+    this.relayChunk = 32 * 1024;
     this._send = send;
     this._key = key;
     this._listeners = {};
