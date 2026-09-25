@@ -49,9 +49,10 @@ async function waitBuffered(dc) {
 async function sendBlobRange(dc, reqId, blob, start, end) {
   const slice = blob.slice(start, end + 1);
   const buf = new Uint8Array(await slice.arrayBuffer());
+  const chunkSize = dc.relayChunk || DATA_CHUNK;
   let offset = start;
-  for (let i = 0; i < buf.length; i += DATA_CHUNK) {
-    const piece = buf.subarray(i, Math.min(i + DATA_CHUNK, buf.length));
+  for (let i = 0; i < buf.length; i += chunkSize) {
+    const piece = buf.subarray(i, Math.min(i + chunkSize, buf.length));
     await waitBuffered(dc);
     if (dc.readyState !== 'open') throw new Error('channel closed');
     dc.send(encodeChunkFrame(reqId, offset, piece));
@@ -312,8 +313,19 @@ export class RemoteLibrary {
   }
 
   _onMessage(ev) {
-    if (typeof ev.data !== 'string' && isChunkBytes(ev.data)) {
-      const frame = decodeChunkFrame(ev.data);
+    const data = ev.data;
+    // binaryType defaults to "blob", and Silk can refuse the switch to
+    // arraybuffer. A Blob is neither a string nor an ArrayBuffer, so without
+    // this the video bytes are dropped and the player never starts.
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      data
+        .arrayBuffer()
+        .then((buf) => this._onMessage({ data: buf }))
+        .catch(() => {});
+      return;
+    }
+    if (typeof data !== 'string' && isChunkBytes(data)) {
+      const frame = decodeChunkFrame(data);
       if (!frame) return;
       const waiter = this._chunks.get(frame.reqId);
       waiter?.push(frame.payload);
