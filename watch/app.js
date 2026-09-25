@@ -8,7 +8,7 @@
 import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, parsePastedShare } from '../src/store.js?v=silk2';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=lan1';
-import { RemoteLibrary, channelAlive } from '../src/session.js?v=seg1';
+import { RemoteLibrary, channelAlive } from '../src/session.js?v=seg2';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js?v=tv1';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
@@ -26,6 +26,11 @@ const merged = [];
 const trackers = trackerListFromLocation();
 let currentItem = null;
 let resumeItem = null;
+let piecePlay = null;
+// 8s is a whole number of AAC frames at 48kHz and of frames at 24/25/30fps.
+// 2s is not, and the player hitched at every join. Silk stays shorter.
+const PIECE_SECONDS = 8;
+const SILK_PIECE_SECONDS = 8 / 3;
 
 const $ = (id) => document.getElementById(id);
 
@@ -297,8 +302,35 @@ function bufferedAhead(video) {
   return 0;
 }
 
+function snapPiece(t, piece) {
+  if (t <= 0) return 0;
+  const n = Math.floor((t + 0.001) / piece);
+  return Math.round(n * piece * 1000) / 1000;
+}
+
+function bufferEndCovering(video, t) {
+  for (let i = 0; i < video.buffered.length; i++) {
+    const a = video.buffered.start(i);
+    const b = video.buffered.end(i);
+    if (a - 0.05 <= t && b > t) return b;
+  }
+  return null;
+}
+
+function coversTime(video, t) {
+  for (let i = 0; i < video.buffered.length; i++) {
+    if (video.buffered.start(i) - 0.05 <= t && video.buffered.end(i) > t + 0.15) return true;
+  }
+  return false;
+}
+
 async function playInPieces(video, lib, item, prepared) {
   if (typeof MediaSource === 'undefined') throw new Error('this browser cannot play this file in pieces');
+  piecePlay?.abort();
+  const ac = new AbortController();
+  piecePlay = ac;
+  const signal = ac.signal;
+
   const ms = new MediaSource();
   const objectUrl = URL.createObjectURL(ms);
   video.dataset.objectUrl = objectUrl;
@@ -307,6 +339,7 @@ async function playInPieces(video, lib, item, prepared) {
     ms.addEventListener('sourceopen', resolve, { once: true });
     ms.addEventListener('error', () => reject(new Error('could not open the player')), { once: true });
   });
+  if (signal.aborted) return;
   const mime = MediaSource.isTypeSupported('video/mp4; codecs="avc1.640033,mp4a.40.2"')
     ? 'video/mp4; codecs="avc1.640033,mp4a.40.2"'
     : 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
@@ -314,11 +347,16 @@ async function playInPieces(video, lib, item, prepared) {
   sb.mode = 'segments';
   const duration = Number(prepared.duration) || 0;
   if (duration) ms.duration = duration;
-  const piece = isSilk() ? 1 : 2;
+  const piece = isSilk() ? SILK_PIECE_SECONDS : PIECE_SECONDS;
+  const ahead = piece * (isSilk() ? 2 : 3);
   let nextAt = 0;
   let busy = false;
-  let sawInit = false;
+  let haveInit = false;
   let token = 0;
+  let pendingSeek = false;
+  let adjusting = false;
+  let failed = false;
+  let lastFetched = -1;
 
   const waitUpdate = () =>
     new Promise((resolve, reject) => {
@@ -336,38 +374,113 @@ async function playInPieces(video, lib, item, prepared) {
       sb.addEventListener('error', fail);
     });
 
+  const idle = async () => {
+    if (sb.updating) await waitUpdate();
+  };
+
+  const note = (text) => {
+    const el = $('playerStatus');
+    el.textContent = text;
+    el.hidden = !text;
+  };
+  const clearPreparing = () => {
+    const el = $('playerStatus');
+    if ((el.textContent || '').startsWith('Preparing')) el.hidden = true;
+  };
+
   const pump = async () => {
-    if (busy || ms.readyState !== 'open' || video.error) return;
+    if (signal.aborted || busy || failed || ms.readyState !== 'open' || video.error) return;
     const t = video.currentTime || 0;
-    if (duration && t >= duration - 0.2) {
-      if (ms.readyState === 'open') ms.endOfStream();
+    if (duration && t >= duration - 0.25 && coversTime(video, t)) {
+      try {
+        if (ms.readyState === 'open') ms.endOfStream();
+      } catch {
+        /* already ended */
+      }
       return;
     }
-    if (sawInit && bufferedAhead(video) > piece * 3) return;
-    const start = sawInit ? Math.max(nextAt, Math.floor(t / piece) * piece) : 0;
-    if (duration && start >= duration) return;
+    const jumping = pendingSeek;
+    if (!jumping && haveInit && bufferedAhead(video) >= ahead && coversTime(video, t)) return;
+    if (jumping) pendingSeek = false;
+    let start;
+    if (jumping) start = snapPiece(Math.min(t, Math.max(0, duration - 0.05)), piece);
+    else if (!haveInit) start = 0;
+    else {
+      const end = bufferEndCovering(video, t);
+      start = end == null ? snapPiece(t, piece) : snapPiece(end - 0.001, piece);
+      if (end != null && start + 0.05 < end && end >= start + piece - 0.15) {
+        start = Math.round((start + piece) * 1000) / 1000;
+      }
+    }
+    if (duration && start >= duration - 0.05) return;
+    if (!jumping && start === lastFetched) return;
+    if (jumping) lastFetched = -1;
+    lastFetched = start;
+    nextAt = start;
     busy = true;
-    const mine = ++token;
-    $('playerStatus').hidden = false;
-    $('playerStatus').textContent = sawInit ? 'Preparing the next few seconds…' : 'Preparing the first few seconds…';
+    const mine = token;
+    // Only while the playhead has nothing to show. Prefetching the next
+    // piece used to flash this line the whole time the movie was playing.
+    const stalled = !haveInit || !coversTime(video, t) || bufferedAhead(video) < 0.35;
+    if (stalled) note(haveInit ? 'Preparing the next few seconds…' : 'Preparing the first few seconds…');
+    else clearPreparing();
+    let showedError = false;
     try {
       const bytes = await lib.segment(item.path, start, piece);
-      if (mine !== token || ms.readyState !== 'open') return;
-      if (sb.updating) await waitUpdate();
-      const body = sawInit ? bytes.subarray(moofStart(bytes)) : bytes;
+      if (signal.aborted || mine !== token || pendingSeek || ms.readyState !== 'open') return;
+      if (!bytes || bytes.byteLength < 32) throw new Error('empty piece');
+      await idle();
+      if (mine !== token || pendingSeek) return;
+      if (jumping && video.buffered.length) {
+        const removed = waitUpdate();
+        sb.remove(0, 1e12);
+        await removed;
+        if (signal.aborted || mine !== token || ms.readyState !== 'open') return;
+      }
+      const body = haveInit ? bytes.subarray(moofStart(bytes)) : bytes;
       sb.timestampOffset = start;
+      sb.appendWindowStart = 0;
+      sb.appendWindowEnd = start + piece;
       const updated = waitUpdate();
       sb.appendBuffer(body);
       await updated;
-      sawInit = true;
-      nextAt = start + piece;
-      if (isSilk() && t > 40 && !sb.updating) {
-        const updatedRemove = waitUpdate();
-        sb.remove(0, t - 20);
-        await updatedRemove;
+      if (signal.aborted || mine !== token || pendingSeek) return;
+      try {
+        sb.appendWindowEnd = Number.POSITIVE_INFINITY;
+      } catch {
+        /* window is only needed while appending */
       }
-      $('playerStatus').hidden = true;
-      if (video.paused) {
+      if (duration && ms.duration + 1 < duration) {
+        try {
+          ms.duration = duration;
+        } catch {
+          /* a remove or append still owns the buffer */
+        }
+      }
+      const started = haveInit;
+      haveInit = true;
+      nextAt = Math.round((start + piece) * 1000) / 1000;
+      if (isSilk() && t > 40 && !sb.updating) {
+        const trimmed = waitUpdate();
+        sb.remove(0, Math.max(0, t - 20));
+        await trimmed;
+      }
+      if (jumping) {
+        const playAt = video.currentTime || 0;
+        for (let i = 0; i < video.buffered.length; i++) {
+          const a = video.buffered.start(i);
+          const b = video.buffered.end(i);
+          if (playAt >= a && playAt < b) break;
+          if (playAt < a && a - playAt < 0.3 && b > a + 0.05) {
+            adjusting = true;
+            video.currentTime = Math.min(a + 0.02, b - 0.02);
+            adjusting = false;
+            break;
+          }
+        }
+      }
+      clearPreparing();
+      if ((!started || jumping) && video.paused) {
         try {
           await video.play();
         } catch {
@@ -375,27 +488,51 @@ async function playInPieces(video, lib, item, prepared) {
         }
       }
     } catch (err) {
-      if (mine !== token) return;
-      $('playerStatus').hidden = false;
-      $('playerStatus').textContent = 'Could not play this file: ' + String(err.message || err);
+      if (signal.aborted || mine !== token || pendingSeek) return;
+      failed = true;
+      showedError = true;
+      note('Could not play this file: ' + String(err.message || err));
       log('segment failed', { err: String(err.message || err) });
     } finally {
       busy = false;
+      if (!showedError && !signal.aborted && !failed && (pendingSeek || token !== mine || bufferedAhead(video) < ahead)) {
+        pump();
+      }
     }
   };
 
-  video.addEventListener('timeupdate', () => {
-    pump();
-  });
-  video.addEventListener('seeking', () => {
-    token++;
-    nextAt = video.currentTime || 0;
-    pump();
-  });
+  video.addEventListener('timeupdate', () => pump(), { signal });
+  video.addEventListener('waiting', () => pump(), { signal });
+  video.addEventListener(
+    'seeking',
+    () => {
+      if (adjusting || signal.aborted) return;
+      const t = video.currentTime || 0;
+      if (coversTime(video, t)) {
+        nextAt = Math.max(nextAt, snapPiece(t, piece));
+        return;
+      }
+      // A skip that arrives while a piece is still being built used to be
+      // thrown away, and the picture sat at the new time with nothing to play.
+      token++;
+      pendingSeek = true;
+      failed = false;
+      nextAt = snapPiece(t, piece);
+      try {
+        if (sb.updating) sb.abort();
+      } catch {
+        /* idle */
+      }
+      pump();
+    },
+    { signal },
+  );
   await pump();
 }
 
 function closePlayer() {
+  piecePlay?.abort();
+  piecePlay = null;
   const video = $('video');
   video.pause();
   if (video.dataset.objectUrl) {
