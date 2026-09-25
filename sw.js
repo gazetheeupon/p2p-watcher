@@ -141,7 +141,7 @@ async function handleStream(request, url) {
   if (!parts) return withCoi(new Response('bad stream url', { status: 400 }));
   let stat;
   try {
-    stat = await rpc({ type: 'stat', sourceId: parts.sourceId, path: parts.path }, STAT_TIMEOUT);
+    stat = await rpc({ type: 'stat', sourceId: parts.sourceId, path: parts.path, page: url.searchParams.get('p') || '' }, STAT_TIMEOUT);
   } catch (err) {
     return withCoi(new Response(String(err.message || err), { status: 503 }));
   }
@@ -164,17 +164,25 @@ async function handleStream(request, url) {
   const range = parseRange(request.headers.get('Range'));
   const { start, end } = capRange(range?.start, range?.end, size, MAX_WINDOW);
   const length = end - start + 1;
+  const page = url.searchParams.get('p') || '';
   const stream = new ReadableStream({
     start(controller) {
+      let sent = 0;
       rpc(
-        { type: 'read', sourceId: parts.sourceId, path: parts.path, start, end },
+        { type: 'read', sourceId: parts.sourceId, path: parts.path, start, end, page },
         READ_TIMEOUT,
         (chunk) => {
-          const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+          if (sent >= length) return;
+          let bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+          if (sent + bytes.byteLength > length) bytes = bytes.subarray(0, length - sent);
+          sent += bytes.byteLength;
           controller.enqueue(bytes);
         },
       )
-        .then(() => controller.close())
+        .then(() => {
+          if (sent !== length) controller.error(new Error('short read'));
+          else controller.close();
+        })
         .catch((err) => controller.error(err));
     },
   });
