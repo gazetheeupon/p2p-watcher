@@ -8,7 +8,8 @@
 import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, parsePastedShare } from '../src/store.js?v=silk2';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=lan1';
-import { RemoteLibrary, channelAlive } from '../src/session.js?v=seg2';
+import { RemoteLibrary, channelAlive } from '../src/session.js?v=seg3';
+import { segmentSpan } from '../src/mp4span.js?v=seg3';
 import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js?v=tv1';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
@@ -437,10 +438,16 @@ async function playInPieces(video, lib, item, prepared) {
         await removed;
         if (signal.aborted || mine !== token || ms.readyState !== 'open') return;
       }
+      // The piece starts at the previous keyframe, not at `start`. Putting
+      // that lead-in on the skip point replayed a few seconds and left the
+      // sound on a different clock.
+      const span = segmentSpan(bytes);
+      const lead = span > piece ? span - piece : 0;
+      const placeAt = Math.max(0, start - lead);
       const body = haveInit ? bytes.subarray(moofStart(bytes)) : bytes;
-      sb.timestampOffset = start;
+      sb.timestampOffset = placeAt;
       sb.appendWindowStart = 0;
-      sb.appendWindowEnd = start + piece;
+      sb.appendWindowEnd = placeAt + (span || piece) + 0.5;
       const updated = waitUpdate();
       sb.appendBuffer(body);
       await updated;
@@ -471,7 +478,7 @@ async function playInPieces(video, lib, item, prepared) {
           const a = video.buffered.start(i);
           const b = video.buffered.end(i);
           if (playAt >= a && playAt < b) break;
-          if (playAt < a && a - playAt < 0.3 && b > a + 0.05) {
+          if (playAt < a && a - playAt < 0.75 && b > a + 0.05) {
             adjusting = true;
             video.currentTime = Math.min(a + 0.02, b - 0.02);
             adjusting = false;
