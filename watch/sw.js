@@ -1,6 +1,13 @@
 /* p2p-watcher service worker: virtual range streaming + COOP/COEP for ffmpeg.wasm */
 const STREAM_MARK = '/virtual-stream/';
 const MAX_WINDOW = 4 * 1024 * 1024;
+const MIN_WINDOW = 64 * 1024;
+
+function streamWindow(url) {
+  const requested = Number(url.searchParams.get('w'));
+  if (!Number.isFinite(requested)) return MAX_WINDOW;
+  return Math.min(MAX_WINDOW, Math.max(MIN_WINDOW, Math.floor(requested)));
+}
 // A real .mkv/.avi remux (as opposed to the few-second test fixtures) can
 // legitimately take minutes, especially when the fallback path has to
 // re-encode rather than just copy streams into a new container. This used
@@ -159,7 +166,7 @@ async function handleStream(request, url) {
     );
   }
   const range = parseRange(request.headers.get('Range'));
-  const { start, end } = capRange(range?.start, range?.end, size, MAX_WINDOW);
+  const { start, end } = capRange(range?.start, range?.end, size, streamWindow(url));
   const length = end - start + 1;
   const page = url.searchParams.get('p') || '';
   let closed = false;
