@@ -9,7 +9,7 @@ import { importKey } from '../src/crypto.js?v=paste1';
 import { consumeHash, loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, parsePastedShare } from '../src/store.js?v=silk2';
 import { Swarm, trackerListFromLocation } from '../src/swarm.js?v=lan1';
 import { RemoteLibrary, channelAlive } from '../src/session.js?v=seek1';
-import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js?v=seek1';
+import { bindStreamBridge, ensureServiceWorker, virtualStreamUrl } from '../src/stream-bridge.js?v=tv1';
 import { qrSvg } from '../src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from '../src/tvnav.js';
 import { connectViewerRelay, isSilk, relayAvailable } from '../src/relay.js?v=silk2';
@@ -235,6 +235,17 @@ async function playItem(item) {
   }
   $('playerStatus').hidden = true;
   video.hidden = false;
+  if (isSilk()) video.preload = 'metadata';
+  if (prepared?.segmented) {
+    try {
+      await playInPieces(video, lib, item, prepared);
+    } catch (err) {
+      $('playerStatus').hidden = false;
+      $('playerStatus').textContent = 'Could not play this file: ' + String(err.message || err);
+      log('segment play failed', { err: String(err) });
+    }
+    return;
+  }
   video.src = virtualStreamUrl(item.sourceId, item.path);
   video.onerror = () => {
     $('playerStatus').hidden = false;
@@ -265,9 +276,132 @@ async function playItem(item) {
   }
 }
 
+function moofStart(bytes) {
+  let o = 0;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  while (o + 8 <= bytes.byteLength) {
+    const size = view.getUint32(o);
+    const type = String.fromCharCode(bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7]);
+    if (type === 'moof') return o;
+    if (size < 8) break;
+    o += size;
+  }
+  return 0;
+}
+
+function bufferedAhead(video) {
+  const t = video.currentTime || 0;
+  for (let i = 0; i < video.buffered.length; i++) {
+    if (video.buffered.start(i) <= t + 0.25 && video.buffered.end(i) > t) return video.buffered.end(i) - t;
+  }
+  return 0;
+}
+
+async function playInPieces(video, lib, item, prepared) {
+  if (typeof MediaSource === 'undefined') throw new Error('this browser cannot play this file in pieces');
+  const ms = new MediaSource();
+  const objectUrl = URL.createObjectURL(ms);
+  video.dataset.objectUrl = objectUrl;
+  video.src = objectUrl;
+  await new Promise((resolve, reject) => {
+    ms.addEventListener('sourceopen', resolve, { once: true });
+    ms.addEventListener('error', () => reject(new Error('could not open the player')), { once: true });
+  });
+  const mime = MediaSource.isTypeSupported('video/mp4; codecs="avc1.640033,mp4a.40.2"')
+    ? 'video/mp4; codecs="avc1.640033,mp4a.40.2"'
+    : 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
+  const sb = ms.addSourceBuffer(mime);
+  sb.mode = 'segments';
+  const duration = Number(prepared.duration) || 0;
+  if (duration) ms.duration = duration;
+  const piece = isSilk() ? 1 : 2;
+  let nextAt = 0;
+  let busy = false;
+  let sawInit = false;
+  let token = 0;
+
+  const waitUpdate = () =>
+    new Promise((resolve, reject) => {
+      const done = () => {
+        sb.removeEventListener('updateend', done);
+        sb.removeEventListener('error', fail);
+        resolve();
+      };
+      const fail = () => {
+        sb.removeEventListener('updateend', done);
+        sb.removeEventListener('error', fail);
+        reject(new Error('player rejected a piece of this file'));
+      };
+      sb.addEventListener('updateend', done);
+      sb.addEventListener('error', fail);
+    });
+
+  const pump = async () => {
+    if (busy || ms.readyState !== 'open' || video.error) return;
+    const t = video.currentTime || 0;
+    if (duration && t >= duration - 0.2) {
+      if (ms.readyState === 'open') ms.endOfStream();
+      return;
+    }
+    if (sawInit && bufferedAhead(video) > piece * 3) return;
+    const start = sawInit ? Math.max(nextAt, Math.floor(t / piece) * piece) : 0;
+    if (duration && start >= duration) return;
+    busy = true;
+    const mine = ++token;
+    $('playerStatus').hidden = false;
+    $('playerStatus').textContent = sawInit ? 'Preparing the next few seconds…' : 'Preparing the first few seconds…';
+    try {
+      const bytes = await lib.segment(item.path, start, piece);
+      if (mine !== token || ms.readyState !== 'open') return;
+      if (sb.updating) await waitUpdate();
+      const body = sawInit ? bytes.subarray(moofStart(bytes)) : bytes;
+      sb.timestampOffset = start;
+      const updated = waitUpdate();
+      sb.appendBuffer(body);
+      await updated;
+      sawInit = true;
+      nextAt = start + piece;
+      if (isSilk() && t > 40 && !sb.updating) {
+        const updatedRemove = waitUpdate();
+        sb.remove(0, t - 20);
+        await updatedRemove;
+      }
+      $('playerStatus').hidden = true;
+      if (video.paused) {
+        try {
+          await video.play();
+        } catch {
+          /* the remote can start playback */
+        }
+      }
+    } catch (err) {
+      if (mine !== token) return;
+      $('playerStatus').hidden = false;
+      $('playerStatus').textContent = 'Could not play this file: ' + String(err.message || err);
+      log('segment failed', { err: String(err.message || err) });
+    } finally {
+      busy = false;
+    }
+  };
+
+  video.addEventListener('timeupdate', () => {
+    pump();
+  });
+  video.addEventListener('seeking', () => {
+    token++;
+    nextAt = video.currentTime || 0;
+    pump();
+  });
+  await pump();
+}
+
 function closePlayer() {
   const video = $('video');
   video.pause();
+  if (video.dataset.objectUrl) {
+    URL.revokeObjectURL(video.dataset.objectUrl);
+    delete video.dataset.objectUrl;
+  }
   video.removeAttribute('src');
   video.load();
   $('player').hidden = true;
