@@ -162,25 +162,44 @@ async function handleStream(request, url) {
   const { start, end } = capRange(range?.start, range?.end, size, MAX_WINDOW);
   const length = end - start + 1;
   const page = url.searchParams.get('p') || '';
+  let closed = false;
   const stream = new ReadableStream({
     start(controller) {
       let sent = 0;
+      const finish = (err) => {
+        if (closed) return;
+        closed = true;
+        try {
+          if (err) controller.error(err);
+          else controller.close();
+        } catch {
+          /* the <video> element already cancelled this response */
+        }
+      };
       rpc(
         { type: 'read', sourceId: parts.sourceId, path: parts.path, start, end, page },
         READ_TIMEOUT,
         (chunk) => {
-          if (sent >= length) return;
+          if (closed || sent >= length) return;
           let bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
           if (sent + bytes.byteLength > length) bytes = bytes.subarray(0, length - sent);
           sent += bytes.byteLength;
-          controller.enqueue(bytes);
+          try {
+            controller.enqueue(bytes);
+          } catch {
+            closed = true;
+          }
         },
       )
         .then(() => {
-          if (sent !== length) controller.error(new Error('short read'));
-          else controller.close();
+          if (closed) return;
+          if (sent !== length) finish(new Error('short read'));
+          else finish();
         })
-        .catch((err) => controller.error(err));
+        .catch((err) => finish(err));
+    },
+    cancel() {
+      closed = true;
     },
   });
   const headers = {
