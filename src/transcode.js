@@ -2,6 +2,19 @@ import { extOf, needsTranscode } from './vfs.js';
 
 let ffmpeg = null;
 let loading = null;
+let ffmpegChain = Promise.resolve();
+
+function withFfmpeg(fn) {
+  const run = ffmpegChain.then(fn, fn);
+  ffmpegChain = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+export const LARGE_REMUX_BYTES = 256 * 1024 * 1024;
+export const SEGMENT_SECONDS = 2;
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -77,9 +90,80 @@ async function mountInput(ff, file) {
   } catch {
     /* fall through to writeFile */
   }
+  if (file.size > 64 * 1024 * 1024) {
+    throw new Error('This file is too large to copy into memory');
+  }
   const { fetchFile } = globalThis.FFmpeg;
   ff.FS('writeFile', inName, await fetchFile(file));
   return { inputPath: inName, mounted: false, inName };
+}
+
+function parseDuration(text) {
+  const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(text);
+  if (!m) return 0;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+export async function probeMediaDuration(file) {
+  return withFfmpeg(async () => {
+    const ff = await ensureFfmpeg();
+    const mount = await mountInput(ff, file);
+    const lines = [];
+    ff.setLogger(({ message }) => lines.push(message));
+    try {
+      await ff.run('-i', mount.inputPath);
+    } catch {
+      /* ffmpeg exits non-zero when it is only asked to identify the file */
+    } finally {
+      unmountInput(ff, mount);
+    }
+    const duration = parseDuration(lines.join('\n'));
+    if (!duration) throw new Error('Could not read how long this file is');
+    return duration;
+  });
+}
+
+export async function remuxSegment(file, start, dur = SEGMENT_SECONDS) {
+  return withFfmpeg(async () => {
+    const ff = await ensureFfmpeg();
+    const mount = await mountInput(ff, file);
+    const out = 'seg.mp4';
+    safeUnlink(ff, out);
+    try {
+      await ff.run(
+        '-ss',
+        String(Math.max(0, start)),
+        '-i',
+        mount.inputPath,
+        '-t',
+        String(dur),
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ac',
+        '2',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-f',
+        'mp4',
+        '-movflags',
+        'frag_keyframe+empty_moov+default_base_moof',
+        out,
+      );
+      const data = copyOut(ff.FS('readFile', out));
+      safeUnlink(ff, out);
+      return data;
+    } finally {
+      unmountInput(ff, mount);
+    }
+  });
 }
 
 function unmountInput(ff, mount) {
@@ -99,6 +183,10 @@ function unmountInput(ff, mount) {
 }
 
 export async function remuxToFragmentedMp4(file, onProgress) {
+  return withFfmpeg(() => remuxWholeFile(file, onProgress));
+}
+
+async function remuxWholeFile(file, onProgress) {
   const ff = await ensureFfmpeg(onProgress);
   const mount = await mountInput(ff, file);
   const outMp4 = 'out.mp4';
