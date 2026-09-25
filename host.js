@@ -12,7 +12,7 @@ import { generateSourceCredentials } from './src/crypto.js?v=tv1';
 import { loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, HOST_STORAGE_KEY } from './src/store.js?v=silk2';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
 import { Swarm, trackerListFromLocation } from './src/swarm.js?v=lan1';
-import { HostLibrary } from './src/session.js?v=lan1';
+import { HostLibrary } from './src/session.js?v=seek1';
 import { bindStreamBridge, ensureServiceWorker } from './src/stream-bridge.js?v=seek1';
 import { qrSvg } from './src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from './src/tvnav.js';
