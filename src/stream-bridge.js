@@ -48,10 +48,16 @@ export function bindStreamBridge(lookup) {
   };
 }
 
+// A Fire TV stick has about 1 GB of RAM and Silk already uses most of it.
+// 512 KB is one slice the player can hold, plus the copies made while a
+// relay chunk is decoded, without crowding out the video decoder.
+export const FIRE_TV_STREAM_WINDOW = 512 * 1024;
+
 export function virtualStreamUrl(sourceId, path) {
   const base = new URL('./virtual-stream/', location.href);
   const url = new URL(encodeURIComponent(sourceId) + '/' + encodeURIComponent(path), base);
   url.searchParams.set('p', pageId());
+  if (/\bSilk\//.test(navigator.userAgent)) url.searchParams.set('w', String(FIRE_TV_STREAM_WINDOW));
   return url.href;
 }
 
