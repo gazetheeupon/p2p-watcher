@@ -9,34 +9,41 @@
 // browser that had ever done both would try to re-connect as a client
 // every time you reopened it as a host).
 import { generateSourceCredentials } from './src/crypto.js?v=tv1';
-import { loadSources, upsertSources, removeSource, buildBundleUrl, HOST_STORAGE_KEY } from './src/store.js?v=tv1';
+import { loadSources, upsertSources, removeSource, buildBundleUrl, buildShareUrl, HOST_STORAGE_KEY } from './src/store.js?v=silk2';
 import { filesFromDataTransfer, filesFromFileList, filesFromDirectoryHandle, buildMap, toFileMap, guessFolderName } from './src/vfs.js';
-import { Swarm, trackerListFromLocation } from './src/swarm.js?v=dc3';
-import { HostLibrary } from './src/session.js?v=dc1';
+import { Swarm, trackerListFromLocation } from './src/swarm.js?v=lan1';
+import { HostLibrary } from './src/session.js?v=lan1';
 import { bindStreamBridge, ensureServiceWorker } from './src/stream-bridge.js';
 import { qrSvg } from './src/qr.js';
 import { bindSpatialNav, bindGlobalEsc } from './src/tvnav.js';
+import { connectHostRelay, lanInfo, relayAvailable } from './src/relay.js?v=silk2';
 
 const logs = [];
 const hosts = new Map();
 const swarms = new Map();
+const relayStops = new Map();
+const relayWatching = new Map();
+let shareOrigin = null;
 const trackers = trackerListFromLocation();
 
 const $ = (id) => document.getElementById(id);
 
+const LOG_LEGEND =
+  'mdns = Wi-Fi name (Fire TV often cannot use it). host = real local IP. public = internet address. relay = none configured.';
+
 function log(msg, extra) {
-  const entry = { t: Date.now(), msg, extra };
-  logs.push(entry);
-  if (logs.length > 200) logs.shift();
+  const text = extra ? msg + ' ' + (typeof extra === 'string' ? extra : JSON.stringify(extra)) : String(msg);
+  if (logs[logs.length - 1] === text) return;
+  logs.push(text);
+  if (logs.length > 16) logs.shift();
+  paintLog();
+  console.log('[p2p-watcher:host]', text);
+}
+
+function paintLog() {
   const el = $('log');
-  if (el && new URLSearchParams(location.search).has('debug')) {
-    el.hidden = false;
-    el.textContent = logs
-      .slice(-40)
-      .map((l) => l.msg + (l.extra ? ' ' + JSON.stringify(l.extra) : ''))
-      .join('\n');
-  }
-  console.log('[p2p-watcher:host]', msg, extra || '');
+  if (!el || el.hidden) return;
+  el.textContent = [LOG_LEGEND, ...logs.slice(-12)].join('\n');
 }
 
 function escapeHtml(s) {
@@ -59,15 +66,20 @@ function formatSize(n) {
   return v.toFixed(v < 10 && i ? 1 : 0) + ' ' + u[i];
 }
 
-// Real file (watch.html), not /watch/ — Fire TV Silk 404s directory indexes
-// when the #fragment is dropped or glued onto the path. Query string + hyphen
-// survive URL pastes that fold case or strip hashes.
+// Real file (watch.html), not /watch/ — Fire TV Silk 404s directory indexes.
+// The share link puts the id and key in the path (/v/…) because the Fire TV
+// remote paste drops "?". 404.html turns that path back into the viewer page.
 function watchPageUrl() {
-  return new URL('./watch.html', location.href).href.replace(/[?#].*$/, '');
+  const base = shareOrigin ? shareOrigin + '/' : location.href;
+  return new URL('watch.html', base).href.replace(/[?#].*$/, '');
+}
+
+function watchingOf(id, swarm) {
+  return (swarm?.watching() || 0) + (relayWatching.get(id) || 0);
 }
 
 function buildWatchShareUrl(id, key) {
-  return watchPageUrl() + '?add=' + String(id).toLowerCase() + '-' + String(key).toLowerCase();
+  return buildShareUrl(watchPageUrl(), id, key);
 }
 
 function render() {
@@ -83,7 +95,7 @@ function render() {
       .map((s) => {
         const swarm = swarms.get(s.id);
         const host = hosts.get(s.id);
-        const peers = swarm?.peers.size || 0;
+        const peers = watchingOf(s.id, swarm);
         const name = host?.map.name || s.name || s.id.slice(0, 8);
         const share = buildWatchShareUrl(s.id, s.key);
         const fileCount = host ? host.map.files.filter((f) => f.kind === 'video' || f.kind === 'audio').length : 0;
@@ -126,7 +138,17 @@ function stopSharing(id) {
   swarm?.destroy();
   swarms.delete(id);
   hosts.delete(id);
+  relayStops.get(id)?.();
+  relayStops.delete(id);
+  relayWatching.delete(id);
   removeSource(id, globalThis.localStorage, HOST_STORAGE_KEY);
+  render();
+}
+
+function noteRelay(id, delta) {
+  relayWatching.set(id, Math.max(0, (relayWatching.get(id) || 0) + delta));
+  const n = watchingOf(id, swarms.get(id));
+  $('status').textContent = n ? `Seeding · ${n} watching` : 'Seeding (waiting for a viewer to connect)';
   render();
 }
 
@@ -149,9 +171,9 @@ async function startHostFromFiles(fileList, nameHint) {
             : ev.state === 'error'
               ? `Remux failed for ${ev.path}: ${ev.message}`
               : 'Ready';
-      log('transcode', ev);
+      if (ev.state === 'error') log('remux failed: ' + ev.message);
     },
-    onLog: (e) => log(e.msg, e.extra),
+    onLog: (e) => log(e.msg),
   });
   hosts.set(creds.id, host);
   upsertSources([{ id: creds.id, key: creds.keyB64, name: map.name, role: 'host' }], globalThis.localStorage, HOST_STORAGE_KEY);
@@ -159,16 +181,40 @@ async function startHostFromFiles(fileList, nameHint) {
     sourceId: creds.id,
     key: creds.key,
     trackers,
-    initiator: true,
+    // The viewer is the only side that creates offers. The host only answers.
+    // Offering from both sides at once (tried for Fire TV) opens two negotiated
+    // data channels against each other and the one that was about to connect
+    // gets closed. One offerer is what PC-to-PC and PC-to-phone were using.
+    initiator: false,
     onDataChannel: ({ dc }) => host.attachChannel(dc),
     onStatus: (st) => {
       $('status').textContent = st.state === 'connected' ? `Seeding · ${st.peers} watching` : 'Seeding (waiting for a viewer to connect)';
       render();
     },
-    onLog: (e) => log(e.msg, e.extra),
+    onLog: (e) => log(e.msg),
   });
   swarms.set(creds.id, swarm);
   await swarm.start();
+  const wan = new URLSearchParams(location.search).has('wan');
+  const localRelay = !wan && (await relayAvailable());
+  {
+    const relay = connectHostRelay(creds.id, (ch) => {
+      host.attachChannel(ch);
+      noteRelay(creds.id, 1);
+      let closed = false;
+      ch.addEventListener('close', () => {
+        if (closed) return;
+        closed = true;
+        noteRelay(creds.id, -1);
+      });
+    }, { public: !localRelay, key: creds.key });
+    relayStops.set(creds.id, () => relay.close());
+    try {
+      await relay.ready;
+    } catch (err) {
+      log('relay failed: ' + String(err.message || err));
+    }
+  }
   $('status').textContent = 'Seeding ' + map.files.filter((f) => f.kind === 'video' || f.kind === 'audio').length + ' file(s) — share the link below';
   render();
   return creds;
@@ -201,7 +247,7 @@ function exposeDebug() {
         watchPageUrl(),
         loadSources(globalThis.localStorage, HOST_STORAGE_KEY).map((s) => ({ id: s.id, key: s.key })),
       ),
-    peers: (id) => swarms.get(id)?.peers.size || 0,
+    peers: (id) => watchingOf(id, swarms.get(id)),
     stopSharing,
   };
 }
@@ -255,6 +301,12 @@ function bindDrop() {
 }
 
 async function boot() {
+  if (!new URLSearchParams(location.search).has('nolan')) {
+    const info = await lanInfo();
+    if (info && (location.hostname === '127.0.0.1' || location.hostname === 'localhost')) {
+      shareOrigin = `${location.protocol}//${info.host}:${info.port || location.port}`;
+    }
+  }
   // The host still needs cross-origin isolation (COOP/COEP) for
   // ffmpeg.wasm's remuxing to work, even though this page never shows a
   // <video> itself — the remux runs here, on demand, whenever a viewer
@@ -278,6 +330,15 @@ async function boot() {
   bindGlobalEsc(() => {
     if (!$('shareModal').hidden) $('shareModal').hidden = true;
   });
+  $('logBtn')?.addEventListener('click', () => {
+    const el = $('log');
+    el.hidden = !el.hidden;
+    if (!el.hidden) paintLog();
+  });
+  if (new URLSearchParams(location.search).has('debug')) {
+    $('log').hidden = false;
+    paintLog();
+  }
   $('bundleBtn').addEventListener('click', showBundle);
   $('closeShare').addEventListener('click', () => {
     $('shareModal').hidden = true;
