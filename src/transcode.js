@@ -116,8 +116,9 @@ export async function remuxToFragmentedMp4(file, onProgress) {
     // even though only the audio track actually needed re-encoding.
     try {
       // Tier 1: copy both streams — fast (seconds), works when the source
-      // is already H.264/HEVC + AAC/MP3, which is common for direct-from-
-      // streaming-service rips.
+      // is already H.264/HEVC + AAC/MP3. +faststart puts the index at the
+      // front so the viewer can play and seek with ordinary range requests.
+      // A fragmented MP4 (empty moov) cannot.
       await ff.run(
         '-i',
         mount.inputPath,
@@ -128,7 +129,7 @@ export async function remuxToFragmentedMp4(file, onProgress) {
         '-c',
         'copy',
         '-movflags',
-        'frag_keyframe+empty_moov+default_base_moof',
+        '+faststart',
         outMp4,
       );
     } catch {
@@ -152,7 +153,7 @@ export async function remuxToFragmentedMp4(file, onProgress) {
           '-b:a',
           '160k',
           '-movflags',
-          'frag_keyframe+empty_moov+default_base_moof',
+          '+faststart',
           outMp4,
         );
       } catch {
