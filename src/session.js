@@ -8,7 +8,7 @@ import {
 } from './protocol.js';
 import { mimeOf, needsTranscode, streamMime } from './vfs.js';
 import { srtToVtt, attachEmbeddedSubtitle } from './subtitles.js';
-import { remuxToFragmentedMp4, probeMediaDuration, remuxSegment, LARGE_REMUX_BYTES } from './transcode.js?v=seek1';
+import { remuxToFragmentedMp4, probeMediaDuration, remuxSegment, LARGE_REMUX_BYTES } from './transcode.js?v=seg1';
 
 function sendJson(dc, obj) {
   if (dc.readyState === 'open') dc.send(JSON.stringify(obj));
