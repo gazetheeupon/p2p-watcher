@@ -41,6 +41,48 @@ export function stripMdnsCandidates(sdp) {
     .join('\r\n');
 }
 
+// Chrome publishes LAN addresses as mDNS names (*.local) instead of 192.168.x.x.
+// Those names are what makes two of your own devices on the same network able to
+// connect. Removing them leaves only the public STUN address, and home routers
+// usually cannot hairpin that back onto the LAN, so nothing connects.
+// ?nomdns=1 still strips them for a Fire TV experiment: Silk often cannot
+// resolve *.local, but stripping is opt-in because it breaks every other device.
+export function summarizeCandidates(sdp) {
+  const counts = { host: 0, mdns: 0, srflx: 0, relay: 0 };
+  for (const line of String(sdp || '').split(/\r?\n/)) {
+    if (!/^a=candidate:/i.test(line)) continue;
+    if (/\.local\b/i.test(line)) counts.mdns++;
+    else if (/ typ host\b/i.test(line)) counts.host++;
+    else if (/ typ srflx\b/i.test(line)) counts.srflx++;
+    else if (/ typ relay\b/i.test(line)) counts.relay++;
+  }
+  return counts;
+}
+
+export function formatCandidates(sdp) {
+  const c = summarizeCandidates(sdp);
+  return `mdns ${c.mdns}, host ${c.host}, public ${c.srflx}, relay ${c.relay}`;
+}
+
+function trackerLabel(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url);
+  }
+}
+
+export function sdpForPeer(sdp, loc = globalThis.location) {
+  const text = String(sdp || '');
+  try {
+    const q = new URLSearchParams(String(loc?.search || '').replace(/^\?/, ''));
+    if (q.has('nomdns')) return stripMdnsCandidates(text);
+  } catch {
+    /* no location in unit tests */
+  }
+  return text;
+}
+
 function openChannel(pc) {
   return pc.createDataChannel('p2p-watcher', DC_OPTS);
 }
@@ -110,14 +152,35 @@ export class Swarm {
     this.infoHash = null;
     this.infoHashBin = null;
     this._timer = null;
+    this._offerTimers = new Set();
     this._onVis = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       this.announce().catch(() => {});
     };
   }
 
-  log(msg, extra) {
-    this.onLog({ sourceId: this.sourceId, msg, extra, t: Date.now() });
+  log(msg) {
+    const text = String(msg || '');
+    if (!text || text === this._lastLog) return;
+    this._lastLog = text;
+    this.onLog({ sourceId: this.sourceId, msg: text, t: Date.now() });
+  }
+
+  // Viewers with an open channel. Half-open offers and failed peer connections
+  // are not viewers — counting those is what made the host number climb.
+  watching() {
+    for (const [key, rec] of [...this.peers]) {
+      const dc = rec?.dc;
+      const pcState = rec?.pc?.connectionState;
+      if (!dc || dc.readyState === 'closed' || dc.readyState === 'closing' || pcState === 'failed' || pcState === 'closed') {
+        this.peers.delete(key);
+      }
+    }
+    const seen = new Set();
+    for (const rec of this.peers.values()) {
+      if (rec.dc?.readyState === 'open' && !seen.has(rec.dc)) seen.add(rec.dc);
+    }
+    return seen.size;
   }
 
   async start() {
@@ -140,15 +203,18 @@ export class Swarm {
         if (!open) this.announce().catch(() => {});
       }, 8000);
     }
-    this.onStatus({ state: 'announcing', peers: 0 });
+    this.onStatus({ state: 'announcing', peers: this.watching() });
   }
 
   destroy() {
     this.destroyed = true;
     clearInterval(this._timer);
     clearInterval(this._hunt);
-    document.removeEventListener('visibilitychange', this._onVis);
-    window.removeEventListener('pageshow', this._onVis);
+    clearTimeout(this._reconnectTimer);
+    for (const t of this._offerTimers) clearTimeout(t);
+    this._offerTimers.clear();
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this._onVis);
+    if (typeof window !== 'undefined') window.removeEventListener('pageshow', this._onVis);
     try {
       this.bc?.close();
     } catch {
@@ -188,13 +254,17 @@ export class Swarm {
       try {
         ws = new WebSocket(url);
       } catch (err) {
-        this.log('tracker url failed', { url, err: String(err) });
+        this.log('tracker failed: ' + trackerLabel(url));
         return;
       }
       this.sockets.set(url, ws);
       ws.addEventListener('open', () => {
         tries = 0;
-        this.log('tracker connected', { url });
+        this._loggedUp = this._loggedUp || new Set();
+        if (!this._loggedUp.has(url)) {
+          this._loggedUp.add(url);
+          this.log('tracker up: ' + trackerLabel(url));
+        }
         this.announce().catch(() => {});
       });
       ws.addEventListener('message', (ev) => {
@@ -207,7 +277,11 @@ export class Swarm {
       });
       ws.addEventListener('close', () => {
         if (this.destroyed) return;
-        this.log('tracker closed', { url });
+        this._loggedDown = this._loggedDown || new Set();
+        if (!this._loggedDown.has(url)) {
+          this._loggedDown.add(url);
+          this.log('tracker down: ' + trackerLabel(url));
+        }
         const delay = Math.min(30000, 1000 * 2 ** Math.min(tries++, 5));
         setTimeout(open, delay);
       });
@@ -255,16 +329,20 @@ export class Swarm {
       const offerIdHex = bytesToHex(offerIdBytes);
       const pc = new RTCPeerConnection(rtcConfig());
       const dc = openChannel(pc);
-      this._wirePc(offerIdHex, pc, dc, true);
+      this._wirePc(offerIdHex, pc, dc);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await waitForUsefulIce(pc);
+      const localSdp = sdpForPeer(pc.localDescription.sdp);
+      this.log('sent offer: ' + formatCandidates(localSdp));
       const packed = await encryptSdp(this.key, {
         type: pc.localDescription.type,
-        sdp: stripMdnsCandidates(pc.localDescription.sdp),
+        sdp: localSdp,
       });
       this.pendingOffers.set(offerIdHex, { pc, dc, createdAt: Date.now() });
-      setTimeout(() => {
+      const offerTimer = setTimeout(() => {
+        this._offerTimers.delete(offerTimer);
+        if (this.destroyed) return;
         const pending = this.pendingOffers.get(offerIdHex);
         if (pending) {
           this.pendingOffers.delete(offerIdHex);
@@ -277,9 +355,11 @@ export class Swarm {
         const rec = this.peers.get(offerIdHex);
         if (rec && rec.dc && rec.dc.readyState !== 'open') {
           this.peers.delete(offerIdHex);
-          this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
+          const n = this.watching();
+          this.onStatus({ state: n ? 'connected' : 'announcing', peers: n });
         }
       }, OFFER_TTL_MS);
+      this._offerTimers.add(offerTimer);
       offers.push({
         offer_id: bytesToBinaryString(offerIdBytes),
         offer: { type: 'offer', sdp: packed },
@@ -288,10 +368,13 @@ export class Swarm {
     return offers;
   }
 
-  _wirePc(id, pc, dc, initiator) {
+  _wirePc(id, pc, dc) {
     pc.addEventListener('connectionstatechange', () => {
-      this.log('pc state', { id, state: pc.connectionState, initiator });
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      // `disconnected` is a transient ICE blip. Treating it as a dead
+      // connection made every blip send fresh offers, and each of those was
+      // counted as another viewer, so the host number climbed forever.
+      if (pc.connectionState === 'failed') {
+        this.log('connection failed');
         this._scheduleReconnect();
       }
     });
@@ -301,65 +384,88 @@ export class Swarm {
   _attachDc(id, pc, dc) {
     if (dc._p2pAttached) return;
     dc._p2pAttached = true;
+    // Separate tries: Silk throws on one of these before the channel is open,
+    // and a single try used to skip binaryType as well. Without arraybuffer,
+    // video chunks arrive as Blobs and the viewer drops them.
     try {
       dc.binaryType = 'arraybuffer';
+    } catch {
+      /* Silk may reject this before open */
+    }
+    try {
       dc.bufferedAmountLowThreshold = 256 * 1024;
     } catch {
-      /* Silk may reject these before open */
+      /* Silk may reject this before open */
     }
     this.peers.set(id, { pc, dc });
     this.onDataChannel({ peerId: id, pc, dc });
     const onOpen = () => {
       if (this.destroyed) return;
-      this.log('datachannel open', { id, label: dc.label });
-      this.onStatus({ state: 'connected', peers: this.peers.size });
+      dc._p2pOpened = true;
+      this.log('channel open');
+      const n = this.watching();
+      this.onStatus({ state: n ? 'connected' : 'announcing', peers: n });
       this.onChannelOpen({ peerId: id, pc, dc });
     };
     if (dc.readyState === 'open') onOpen();
     else dc.addEventListener('open', onOpen, { once: true });
     dc.addEventListener('close', () => {
-      this.peers.delete(id);
-      this.onStatus({ state: this.peers.size ? 'connected' : 'announcing', peers: this.peers.size });
+      // The entry may have been re-keyed from the offer id to the peer id.
+      for (const [key, rec] of this.peers) {
+        if (rec.dc === dc) this.peers.delete(key);
+      }
+      if (dc._p2pOpened) this.log('channel closed');
+      const n = this.watching();
+      this.onStatus({ state: n ? 'connected' : 'announcing', peers: n });
       this._scheduleReconnect();
     });
   }
 
   _scheduleReconnect() {
-    if (this.destroyed) return;
+    if (this.destroyed || this.watching() > 0) return;
     clearTimeout(this._reconnectTimer);
-    this._reconnectTimer = setTimeout(() => this.announce().catch(() => {}), 1500);
+    this._reconnectTimer = setTimeout(() => {
+      if (this.destroyed || this.watching() > 0) return;
+      this.announce().catch(() => {});
+    }, 1500);
   }
 
   async _onTrackerMessage(data) {
-    if (!data || data.action !== 'announce') return;
-    if (data.info_hash && data.info_hash !== this.infoHashBin) return;
-    if (data.peer_id && data.peer_id === this.peerIdBin) return;
-    if (data.offer && data.peer_id) {
-      await this._onRemoteOffer({
-        peerIdBin: data.peer_id,
-        peerIdHex: bytesToHex(binaryish(data.peer_id)),
-        offer: data.offer,
-        offerId: data.offer_id,
-      });
-    }
-    if (data.answer && data.peer_id) {
-      await this._onRemoteAnswer({
-        peerIdHex: bytesToHex(binaryish(data.peer_id)),
-        answer: data.answer,
-        offerIdHex: bytesToHex(binaryish(data.offer_id)),
-      });
+    try {
+      if (!data || data.action !== 'announce') return;
+      if (data.info_hash && data.info_hash !== this.infoHashBin) return;
+      if (data.peer_id && data.peer_id === this.peerIdBin) return;
+      // Only the host answers offers. A viewer that answers too will connect
+      // to the other viewer, handshake with nobody who has the files, and
+      // then stop trying the host.
+      if (!this.initiator && data.offer && data.peer_id) {
+        await this._onRemoteOffer({
+          peerIdBin: data.peer_id,
+          peerIdHex: bytesToHex(binaryish(data.peer_id)),
+          offer: data.offer,
+          offerId: data.offer_id,
+        });
+      }
+      if (data.answer && data.peer_id) {
+        await this._onRemoteAnswer({
+          peerIdHex: bytesToHex(binaryish(data.peer_id)),
+          answer: data.answer,
+          offerIdHex: bytesToHex(binaryish(data.offer_id)),
+        });
+      }
+    } catch (err) {
+      this.log('signaling error: ' + String(err && err.message ? err.message : err));
     }
   }
 
   async _onBroadcast(data) {
     if (!data || data.from === this.peerIdHex) return;
-    if (data.kind === 'offer') {
+    if (!this.initiator && data.kind === 'offer') {
       await this._onRemoteOffer({
         peerIdHex: data.from,
         peerIdBin: hexToBinaryString(data.from),
         offer: data.offer,
         offerId: hexToBinaryString(data.offer_id),
-        via: 'broadcast',
       });
     } else if (data.kind === 'answer' && data.to === this.peerIdHex) {
       await this._onRemoteAnswer({
@@ -370,7 +476,7 @@ export class Swarm {
     }
   }
 
-  async _onRemoteOffer({ peerIdHex, peerIdBin, offer, offerId, via }) {
+  async _onRemoteOffer({ peerIdHex, peerIdBin, offer, offerId }) {
     const existing = this.peers.get(peerIdHex);
     if (existing?.dc?.readyState === 'open') return;
     if (existing) {
@@ -384,21 +490,24 @@ export class Swarm {
     let desc;
     try {
       desc = await decryptSdp(this.key, offer.sdp);
-      desc.sdp = stripMdnsCandidates(desc.sdp);
+      desc.sdp = sdpForPeer(desc.sdp);
+      this.log('got offer: ' + formatCandidates(desc.sdp));
     } catch {
-      this.log('offer decrypt failed (wrong key or foreign swarm)', { peerIdHex });
+      this.log('could not decrypt offer');
       return;
     }
     const pc = new RTCPeerConnection(rtcConfig());
     const dc = openChannel(pc);
-    this._wirePc(peerIdHex, pc, dc, false);
+    this._wirePc(peerIdHex, pc, dc);
     await pc.setRemoteDescription(desc);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await waitForUsefulIce(pc);
+    const localSdp = sdpForPeer(pc.localDescription.sdp);
+    this.log('sent answer: ' + formatCandidates(localSdp));
     const packed = await encryptSdp(this.key, {
       type: pc.localDescription.type,
-      sdp: stripMdnsCandidates(pc.localDescription.sdp),
+      sdp: localSdp,
     });
     const payload = {
       action: 'announce',
@@ -421,7 +530,6 @@ export class Swarm {
         answer: { type: 'answer', sdp: packed },
       });
     }
-    this.log('answered offer', { peerIdHex, via: via || 'tracker' });
   }
 
   async _onRemoteAnswer({ peerIdHex, answer, offerIdHex }) {
@@ -430,13 +538,28 @@ export class Swarm {
     let desc;
     try {
       desc = await decryptSdp(this.key, answer.sdp);
-      desc.sdp = stripMdnsCandidates(desc.sdp);
+      desc.sdp = sdpForPeer(desc.sdp);
+      this.log('got answer: ' + formatCandidates(desc.sdp));
     } catch {
-      this.log('answer decrypt failed', { peerIdHex });
+      this.log('could not decrypt answer');
       return;
     }
     this.pendingOffers.delete(offerIdHex);
     await pending.pc.setRemoteDescription(desc);
+    // One connection was stored under the random offer id when the offer was
+    // created. Re-key it to the real peer id so the count is not doubled and
+    // so closing the channel removes the entry the UI is actually showing.
+    const speculative = this.peers.get(offerIdHex);
+    if (speculative && speculative.dc === pending.dc) this.peers.delete(offerIdHex);
+    const displaced = this.peers.get(peerIdHex);
+    if (displaced && displaced.dc !== pending.dc) {
+      this.peers.delete(peerIdHex);
+      try {
+        displaced.pc.close();
+      } catch {
+        /* ignore */
+      }
+    }
     this.peers.set(peerIdHex, { pc: pending.pc, dc: pending.dc });
   }
 }
