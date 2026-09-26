@@ -318,6 +318,21 @@ function bufferEndCovering(video, t) {
   return null;
 }
 
+// Ask for the next piece from just inside what we already have. Starting on
+// the far side of that edge left a gap (the next keyframe was later), and
+// the picture stopped on the spinner in the hole.
+function nextPieceStart(video, t, piece) {
+  let end = bufferEndCovering(video, t);
+  if (end == null) {
+    for (let i = 0; i < video.buffered.length; i++) {
+      const b = video.buffered.end(i);
+      if (b <= t + 0.05 && t - b < 2 && (end == null || b > end)) end = b;
+    }
+  }
+  if (end == null) return snapPiece(t, piece);
+  return Math.max(0, Math.round((end - 0.75) * 1000) / 1000);
+}
+
 function coversTime(video, t) {
   for (let i = 0; i < video.buffered.length; i++) {
     if (video.buffered.start(i) - 0.05 <= t && video.buffered.end(i) > t + 0.15) return true;
@@ -404,15 +419,13 @@ async function playInPieces(video, lib, item, prepared) {
     if (!jumping && haveInit && bufferedAhead(video) >= ahead && coversTime(video, t)) return;
     if (jumping) pendingSeek = false;
     let start;
-    if (jumping) start = snapPiece(Math.min(t, Math.max(0, duration - 0.05)), piece);
-    else if (!haveInit) start = 0;
-    else {
-      const end = bufferEndCovering(video, t);
-      start = end == null ? snapPiece(t, piece) : snapPiece(end - 0.001, piece);
-      if (end != null && start + 0.05 < end && end >= start + piece - 0.15) {
-        start = Math.round((start + piece) * 1000) / 1000;
-      }
-    }
+    let dur = piece;
+    if (!haveInit && !jumping) start = 0;
+    else if (jumping) {
+      // One block past the playhead. The keyframe before this point comes
+      // along inside the piece, so the new position is covered immediately.
+      start = Math.max(0, Math.round((Math.min(t, Math.max(0, duration - 0.05)) - 0.25) * 1000) / 1000);
+    } else start = nextPieceStart(video, t, piece);
     if (duration && start >= duration - 0.05) return;
     if (!jumping && start === lastFetched) return;
     if (jumping) lastFetched = -1;
@@ -427,7 +440,7 @@ async function playInPieces(video, lib, item, prepared) {
     else clearPreparing();
     let showedError = false;
     try {
-      const bytes = await lib.segment(item.path, start, piece);
+      const bytes = await lib.segment(item.path, start, dur);
       if (signal.aborted || mine !== token || pendingSeek || ms.readyState !== 'open') return;
       if (!bytes || bytes.byteLength < 32) throw new Error('empty piece');
       await idle();
@@ -442,7 +455,7 @@ async function playInPieces(video, lib, item, prepared) {
       // that lead-in on the skip point replayed a few seconds and left the
       // sound on a different clock.
       const span = segmentSpan(bytes);
-      const lead = span > piece ? span - piece : 0;
+      const lead = span > dur ? span - dur : 0;
       const placeAt = Math.max(0, start - lead);
       const body = haveInit ? bytes.subarray(moofStart(bytes)) : bytes;
       sb.timestampOffset = placeAt;
@@ -517,6 +530,20 @@ async function playInPieces(video, lib, item, prepared) {
       const t = video.currentTime || 0;
       if (coversTime(video, t)) {
         nextAt = Math.max(nextAt, snapPiece(t, piece));
+        return;
+      }
+      // Running off the end of the buffer fires seeking too. That is the
+      // player waiting for the next piece, not a new skip. Wiping the buffer
+      // there left the spinner up.
+      let edge = bufferEndCovering(video, t + 0.3);
+      if (edge == null) {
+        for (let i = 0; i < video.buffered.length; i++) {
+          const b = video.buffered.end(i);
+          if (b <= t + 0.3 && t - b < 2) edge = b;
+        }
+      }
+      if (edge != null && t >= edge - 1.25) {
+        pump();
         return;
       }
       // A skip that arrives while a piece is still being built used to be
